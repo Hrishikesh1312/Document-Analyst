@@ -1,16 +1,28 @@
 from __future__ import annotations
 
+import logging
 import warnings
 from pathlib import Path
 
 from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download
 
-# `sentence-transformers` can trigger noisy upstream Transformers warnings about
-# `__path__` on import (e.g., from zoedepth, maskformer). These are harmless for text-only usage.
+# `sentence-transformers` can trigger noisy upstream Transformers messages about
+# `__path__` on import (e.g., from zoedepth, maskformer). These are harmless for
+# this app's text-only usage. Depending on the library version, the message may
+# arrive as a warning or as a logger record, so we filter both forms.
 warnings.filterwarnings(
     "ignore",
-    message=r".*Accessing `__path__` from `.models\.(zoedepth\.image_processing_zoedepth|maskformer\.image_processing_maskformer)`.*",
+    message=r".*Accessing `__path__` from `.models\..*image_processing_.*`.*",
 )
+
+
+class _TransformersPathWarningFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        return "Accessing `__path__` from `.models." not in message
+
+
+logging.getLogger("transformers").addFilter(_TransformersPathWarningFilter())
 from sentence_transformers import SentenceTransformer
 
 from document_analyst.config import AppSettings

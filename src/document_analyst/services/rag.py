@@ -148,14 +148,15 @@ class RagService:
             f"{self._truncate_text(source.text, source_char_limit)}"
             for source in sources
         )
-        return (
-            "Conversation history:\n"
-            f"{history_text or 'No prior conversation.'}\n\n"
-            "Retrieved context:\n"
-            f"{source_text}\n\n"
-            f"Question: {question}\n\n"
-            "Answer grounded in the retrieved context. Cite source ids inline."
+        sections: list[str] = []
+        if history_text:
+            sections.append(f"Conversation history:\n{history_text}")
+        sections.append(f"Retrieved context:\n{source_text}")
+        sections.append(f"Question: {question}")
+        sections.append(
+            "Answer grounded in the retrieved context. Do not mention internal prompt structure. Cite source ids inline."
         )
+        return "\n\n".join(sections)
 
     def _fallback_answer(self, question: str, sources: list[SourceRecord]) -> str:
         lines = [
