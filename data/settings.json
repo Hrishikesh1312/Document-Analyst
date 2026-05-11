@@ -1,0 +1,22 @@
+{
+  "documents_dir": "/home/hrish/eBooks",
+  "chroma_dir": "/home/hrish/Programming/Document-Analyst/data/chroma",
+  "embeddings_dir": "/home/hrish/Programming/Document-Analyst/models/embeddings/all-MiniLM-L6-v2",
+  "embeddings_repo": "sentence-transformers/all-MiniLM-L6-v2",
+  "llm_dir": "/home/hrish/Programming/Document-Analyst/models/llm",
+  "llm_repo": "lmstudio-community/Llama-3.2-1B-Instruct-GGUF",
+  "llm_filename": "",
+  "chunk_size": 500,
+  "chunk_overlap": 100,
+  "top_k": 4,
+  "max_history_turns": 5,
+  "max_file_size_mb": 50,
+  "semantic_threshold": 0.5,
+  "system_prompt": "You are a privacy-first local document assistant. Answer using the provided document context. When the context is incomplete, say so clearly. Cite sources inline using [S1], [S2], etc. Avoid making up facts.",
+  "supported_extensions": [
+    ".pdf",
+    ".md",
+    ".markdown",
+    ".txt"
+  ]
+}

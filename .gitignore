@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+data/chroma/
+data/uploads/
+data/cache/
+models
+models/embeddings/
+models/llm/
