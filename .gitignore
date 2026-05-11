@@ -9,3 +9,4 @@ data/cache/
 models
 models/embeddings/
 models/llm/
+*.egg-info/

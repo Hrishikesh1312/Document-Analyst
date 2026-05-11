@@ -5,11 +5,11 @@ from pathlib import Path
 
 from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download
 
-# `sentence-transformers` can trigger a noisy upstream Transformers warning about
-# `zoedepth.__path__` on import. It is harmless for this app's text-only usage.
+# `sentence-transformers` can trigger noisy upstream Transformers warnings about
+# `__path__` on import (e.g., from zoedepth, maskformer). These are harmless for text-only usage.
 warnings.filterwarnings(
     "ignore",
-    message=r".*Accessing `__path__` from `.models\.zoedepth\.image_processing_zoedepth`.*",
+    message=r".*Accessing `__path__` from `.models\.(zoedepth\.image_processing_zoedepth|maskformer\.image_processing_maskformer)`.*",
 )
 from sentence_transformers import SentenceTransformer
 

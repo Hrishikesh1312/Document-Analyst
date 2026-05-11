@@ -1,5 +1,5 @@
 {
-  "documents_dir": "/home/hrish/eBooks",
+  "documents_dir": "/home/hrish/Downloads/demo",
   "chroma_dir": "/home/hrish/Programming/Document-Analyst/data/chroma",
   "embeddings_dir": "/home/hrish/Programming/Document-Analyst/models/embeddings/all-MiniLM-L6-v2",
   "embeddings_repo": "sentence-transformers/all-MiniLM-L6-v2",

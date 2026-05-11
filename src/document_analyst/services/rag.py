@@ -26,6 +26,10 @@ class AnswerResult:
 
 
 class RagService:
+    LLM_CONTEXT_WINDOW = 4096
+    LLM_MAX_OUTPUT_TOKENS = 700
+    PROMPT_TOKEN_BUDGET = 3000
+
     def __init__(self, settings: AppSettings) -> None:
         self.settings = settings
         self.models = ModelManager(settings)
@@ -55,7 +59,7 @@ class RagService:
         threads = max(2, (os.cpu_count() or 4) - 1)
         self._llm = Llama(
             model_path=str(llm_path),
-            n_ctx=4096,
+            n_ctx=self.LLM_CONTEXT_WINDOW,
             n_threads=threads,
             n_batch=512,
             verbose=False,
@@ -94,13 +98,14 @@ class RagService:
             text = self._fallback_answer(question, sources)
         else:
             llm = self.ensure_llm()
+            prompt = self._fit_prompt_to_context(llm, question, sources, history)
             response = llm.create_chat_completion(
                 messages=[
                     {"role": "system", "content": self.settings.system_prompt},
                     {"role": "user", "content": prompt},
                 ],
                 temperature=0.2,
-                max_tokens=700,
+                max_tokens=self.LLM_MAX_OUTPUT_TOKENS,
             )
             text = response["choices"][0]["message"]["content"].strip()
         return AnswerResult(answer=text, sources=sources)
@@ -130,13 +135,17 @@ class RagService:
         question: str,
         sources: list[SourceRecord],
         history: list[dict[str, str]],
+        source_char_limit: int | None = None,
+        history_char_limit: int | None = None,
     ) -> str:
         history_window = history[-self.settings.max_history_turns * 2 :]
         history_text = "\n".join(
-            f"{item['role'].title()}: {item['content']}" for item in history_window
+            f"{item['role'].title()}: {self._truncate_text(item['content'], history_char_limit)}"
+            for item in history_window
         )
         source_text = "\n\n".join(
-            f"[{source.source_id}] {source.document_name} (page {source.approx_page})\n{source.text}"
+            f"[{source.source_id}] {source.document_name} (page {source.approx_page})\n"
+            f"{self._truncate_text(source.text, source_char_limit)}"
             for source in sources
         )
         return (
@@ -161,3 +170,56 @@ class RagService:
         lines.append("")
         lines.append("Open `Models & Settings` and download the recommended GGUF to enable full local generation.")
         return "\n".join(lines)
+
+    def _fit_prompt_to_context(
+        self,
+        llm: Llama,
+        question: str,
+        sources: list[SourceRecord],
+        history: list[dict[str, str]],
+    ) -> str:
+        source_limit = 900
+        history_limit = 350
+        prompt = self._build_prompt(
+            question,
+            sources,
+            history,
+            source_char_limit=source_limit,
+            history_char_limit=history_limit,
+        )
+
+        while self._token_count(llm, prompt) > self.PROMPT_TOKEN_BUDGET:
+            if source_limit > 220:
+                source_limit = max(220, source_limit - 160)
+            elif history_limit > 120:
+                history_limit = max(120, history_limit - 60)
+            elif len(sources) > 2:
+                sources = sources[: len(sources) - 1]
+            elif len(history) > 2:
+                history = history[2:]
+            else:
+                prompt = self._build_prompt(
+                    question,
+                    sources[:2],
+                    [],
+                    source_char_limit=180,
+                    history_char_limit=80,
+                )
+                break
+
+            prompt = self._build_prompt(
+                question,
+                sources,
+                history,
+                source_char_limit=source_limit,
+                history_char_limit=history_limit,
+            )
+        return prompt
+
+    def _token_count(self, llm: Llama, text: str) -> int:
+        return len(llm.tokenize(text.encode("utf-8")))
+
+    def _truncate_text(self, text: str, limit: int | None) -> str:
+        if limit is None or len(text) <= limit:
+            return text
+        return text[: max(0, limit - 3)].rstrip() + "..."
