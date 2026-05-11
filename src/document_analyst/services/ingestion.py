@@ -5,6 +5,12 @@ from pathlib import Path
 
 import fitz
 import numpy as np
+from PIL import Image
+
+try:
+    import pytesseract
+except ImportError:  # pragma: no cover
+    pytesseract = None
 
 from document_analyst.config import AppSettings
 from document_analyst.models import ChunkRecord, DocumentRecord, PageSpan
@@ -27,6 +33,7 @@ class DocumentIngestor:
     def load_documents(self, directory: str) -> tuple[list[DocumentRecord], list[str]]:
         documents: list[DocumentRecord] = []
         warnings: list[str] = []
+        warned_about_ocr_runtime = False
         for path in self.discover(directory):
             try:
                 if path.stat().st_size > self.max_size_bytes:
@@ -35,6 +42,9 @@ class DocumentIngestor:
                 documents.append(self.load_document(path))
             except Exception as exc:  # pragma: no cover - defensive runtime handling
                 warnings.append(f"Skipped {path.name}: {exc}")
+            if self.settings.enable_ocr and pytesseract is None and not warned_about_ocr_runtime:
+                warnings.append("OCR is enabled, but the `pytesseract` Python package is not available.")
+                warned_about_ocr_runtime = True
         return documents, warnings
 
     def load_document(self, path: Path) -> DocumentRecord:
@@ -78,9 +88,30 @@ class DocumentIngestor:
         with fitz.open(path) as doc:
             for index, page in enumerate(doc, start=1):
                 text = page.get_text("text").strip()
+                if self._should_run_ocr(text):
+                    ocr_text = self._ocr_page(page).strip()
+                    if len(ocr_text) > len(text):
+                        text = ocr_text
                 if text:
                     spans.append(PageSpan(page_number=index, text=text))
         return spans
+
+    def _should_run_ocr(self, text: str) -> bool:
+        return self.settings.enable_ocr and len(text.strip()) < self.settings.ocr_min_text_chars
+
+    def _ocr_page(self, page: fitz.Page) -> str:
+        if pytesseract is None:
+            return ""
+        if self.settings.tesseract_cmd.strip():
+            pytesseract.pytesseract.tesseract_cmd = self.settings.tesseract_cmd.strip()
+
+        matrix = fitz.Matrix(self.settings.ocr_zoom, self.settings.ocr_zoom)
+        pix = page.get_pixmap(matrix=matrix, alpha=False)
+        mode = "RGB" if pix.n < 4 else "RGBA"
+        image = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
+        if mode == "RGBA":
+            image = image.convert("RGB")
+        return pytesseract.image_to_string(image)
 
     def _chunk_document(self, document: DocumentRecord, embed_texts: callable) -> list[ChunkRecord]:
         sentences, pages = self._split_sentences(document.page_spans)

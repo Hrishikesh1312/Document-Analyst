@@ -9,6 +9,7 @@ dependencies = [
   "huggingface_hub>=1.14.0",
   "llama-cpp-python>=0.3.22",
   "pymupdf>=1.27.2.3",
+  "pytesseract>=0.3.10",
   "sentence-transformers>=5.4.1",
   "streamlit>=1.57.0",
 ]

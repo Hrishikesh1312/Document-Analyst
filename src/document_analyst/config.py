@@ -43,6 +43,10 @@ class AppSettings:
     max_history_turns: int = 5
     max_file_size_mb: int = 50
     semantic_threshold: float = 0.5
+    enable_ocr: bool = False
+    ocr_min_text_chars: int = 80
+    ocr_zoom: float = 2.0
+    tesseract_cmd: str = ""
     system_prompt: str = (
         "You are a privacy-first local document assistant. Answer using the provided "
         "document context. When the context is incomplete, say so clearly. Cite sources "

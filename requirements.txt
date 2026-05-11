@@ -4,5 +4,6 @@ chromadb
 huggingface_hub
 llama-cpp-python
 pymupdf
+pytesseract
 sentence-transformers
 streamlit

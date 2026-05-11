@@ -30,13 +30,26 @@ def run() -> None:
         st.session_state.sources_by_turn = {}
     if "active_view" not in st.session_state:
         st.session_state.active_view = "Chat"
+    if "show_empty_state_dialog" not in st.session_state:
+        st.session_state.show_empty_state_dialog = True
 
     settings: AppSettings = st.session_state.settings
     service = RagService(settings)
+    stats = service.stats()
+
+    if stats["documents"] > 0 or stats["chunks"] > 0:
+        st.session_state.show_empty_state_dialog = False
 
     active_view = _sidebar(settings, service)
     _inject_theme()
     _hero(service)
+
+    if (
+        stats["documents"] == 0
+        and stats["chunks"] == 0
+        and st.session_state.show_empty_state_dialog
+    ):
+        _empty_state_dialog()
 
     if active_view == "Chat":
         _chat_tab(service)
@@ -170,6 +183,35 @@ def _hero(service: RagService) -> None:
     st.write("")
 
 
+@st.dialog("No Documents Yet", width="large")
+def _empty_state_dialog() -> None:
+    st.markdown(
+        """
+        Your local index is empty right now.
+
+        To get started:
+        1. Open `Models & Settings` and configure or download your embedding / GGUF models.
+        2. Open `Manage Documents` and add the local document folder you want to index.
+        3. Build the index, then come back to `Chat` to start asking questions.
+        """
+    )
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        if st.button("Open Models & Settings", use_container_width=True):
+            st.session_state.active_view = "Models & Settings"
+            st.session_state.show_empty_state_dialog = False
+            st.rerun()
+    with col2:
+        if st.button("Open Manage Documents", use_container_width=True):
+            st.session_state.active_view = "Manage Documents"
+            st.session_state.show_empty_state_dialog = False
+            st.rerun()
+    with col3:
+        if st.button("Dismiss", use_container_width=True):
+            st.session_state.show_empty_state_dialog = False
+            st.rerun()
+
+
 def _chat_tab(service: RagService) -> None:
     left, right = st.columns([1.65, 1], gap="large")
     with left:
@@ -247,6 +289,7 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
             - Overlap: `{settings.chunk_overlap}` chars
             - Semantic threshold: `{settings.semantic_threshold}`
             - Top-k retrieval: `{settings.top_k}`
+            - OCR fallback: `{"On" if settings.enable_ocr else "Off"}`
             """
         )
 
@@ -318,6 +361,31 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
             value=float(settings.semantic_threshold),
             step=0.05,
         )
+        enable_ocr = st.checkbox(
+            "Enable OCR fallback for scanned PDFs",
+            value=settings.enable_ocr,
+            help="If a PDF page has very little extractable text, render it and run Tesseract OCR.",
+        )
+        ocr_min_text_chars = st.slider(
+            "OCR trigger threshold (characters)",
+            min_value=20,
+            max_value=200,
+            value=int(settings.ocr_min_text_chars),
+            help="Run OCR on a PDF page when extracted text is shorter than this threshold.",
+        )
+        ocr_zoom = st.slider(
+            "OCR render scale",
+            min_value=1.0,
+            max_value=3.0,
+            value=float(settings.ocr_zoom),
+            step=0.25,
+            help="Higher render scales can improve OCR quality, but are slower.",
+        )
+        tesseract_cmd = st.text_input(
+            "Tesseract executable path (optional)",
+            value=settings.tesseract_cmd,
+            help="Set this only if Tesseract is installed outside your normal PATH.",
+        )
         saved = st.form_submit_button("Save Settings", use_container_width=True)
     if saved:
         repo_changed = embeddings_repo.strip() != settings.embeddings_repo or llm_repo.strip() != settings.llm_repo
@@ -327,6 +395,10 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         settings.top_k = int(top_k)
         settings.max_history_turns = int(max_history_turns)
         settings.semantic_threshold = float(semantic_threshold)
+        settings.enable_ocr = bool(enable_ocr)
+        settings.ocr_min_text_chars = int(ocr_min_text_chars)
+        settings.ocr_zoom = float(ocr_zoom)
+        settings.tesseract_cmd = tesseract_cmd.strip()
         save_settings(settings)
         st.session_state.settings = settings
         st.success("Settings saved.")

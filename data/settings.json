@@ -12,6 +12,10 @@
   "max_history_turns": 5,
   "max_file_size_mb": 50,
   "semantic_threshold": 0.5,
+  "enable_ocr": false,
+  "ocr_min_text_chars": 80,
+  "ocr_zoom": 2.0,
+  "tesseract_cmd": "",
   "system_prompt": "You are a privacy-first local document assistant. Answer using the provided document context. When the context is incomplete, say so clearly. Cite sources inline using [S1], [S2], etc. Avoid making up facts.",
   "supported_extensions": [
     ".pdf",
