@@ -1,51 +1,88 @@
 # Document Analyst
 
-Document Analyst is a privacy-first Streamlit desktop-style app for semantic search and local question-answering over PDFs, Markdown, and text files.
+Document Analyst is a privacy-first local RAG application for PDFs, Markdown,
+and text files. It runs on macOS, Windows, and Linux and keeps documents,
+embeddings, vector data, and inference on the local machine.
 
-## Features
+## What is portable now
 
-- Local document ingestion for `.pdf`, `.md`, `.markdown`, and `.txt`
-- Semantic chunking with sentence-level similarity boundaries
-- Persistent local vector store with `ChromaDB`
-- Multi-turn chat over retrieved document context
-- Inline source citations plus expandable source cards
-- First-launch model download into `models/`
-- Light/dark appearance toggle
-- CPU-friendly local inference through `llama-cpp-python`
+- Runtime data uses the native per-user application-data location instead of
+  writing into the source checkout.
+- Paths use `pathlib`; document traversal does not follow symbolic links.
+- Settings are validated and replaced atomically, with corrupt files backed up.
+- Native ML runtimes load only when indexing or answering requires them.
+- Chroma handles are cached across Streamlit reruns and large writes are batched.
+- Re-indexing removes stale chunks, and rendered document content is HTML-escaped.
 
-## Stack
+Default data locations:
 
-- `Streamlit`
-- `ChromaDB`
-- `PyMuPDF`
-- `sentence-transformers`
-- `llama-cpp-python`
-- `huggingface_hub`
+- macOS: `~/Library/Application Support/Document Analyst`
+- Windows: `%LOCALAPPDATA%\Document Analyst`
+- Linux: `$XDG_DATA_HOME/document-analyst` or `~/.local/share/document-analyst`
 
-## Run
+Set `DOCUMENT_ANALYST_HOME` before launch to use a custom location.
 
-If the local environment already exists:
+## Install
+
+Python 3.10–3.13 is supported. A fresh virtual environment is strongly
+recommended.
+
+### macOS
+
+Install Python from python.org or Homebrew. On Apple Silicon, make sure Python
+and the terminal use the same architecture (`arm64`). Then run:
 
 ```bash
-.venv/bin/streamlit run app.py
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m streamlit run app.py
 ```
 
-If you need to install dependencies in a fresh environment:
+Optional OCR requires the system Tesseract executable:
 
 ```bash
-python3 -m pip install -r requirements.txt
+brew install tesseract
 ```
+
+### Windows
+
+```powershell
+py -3.12 -m venv .venv
+.venv\Scripts\Activate.ps1
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m streamlit run app.py
+```
+
+### Linux
+
+```bash
+python3 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -e .
+python -m streamlit run app.py
+```
+
+After installation, `document-analyst` is also available as a launcher.
 
 ## First launch
 
-1. Open the `Models & Settings` tab.
-2. Click `Download Recommended Models`.
-3. Wait for the embedding model and a GGUF file to download into `models/`.
-4. Go to `Manage Documents`, choose a local folder, and build the index.
-5. Use the `Chat` tab to ask grounded questions.
+1. Open **Models & Settings** and download the selected models.
+2. Open **Manage Documents**, choose a readable folder, and build the index.
+3. Return to **Chat** and ask questions about the indexed content.
 
-## Notes
+The first download can be several gigabytes. Chat history remains session-only.
 
-- Chat history is session-only for privacy.
-- The app assumes consumer hardware with CPU inference.
-- If the default GGUF repo changes upstream, you can override it in `Models & Settings`.
+## Verify a development checkout
+
+```bash
+python -m pip install -e '.[dev]'
+python -m pytest
+python -m compileall -q src app.py
+```
+
+For reproducible deployments, create a lock file on each target architecture;
+PyTorch and llama.cpp wheels differ between operating systems and CPU types.

@@ -1,5 +1,11 @@
 from __future__ import annotations
 
+import html
+import json
+import queue
+import threading
+import time
+from dataclasses import asdict
 from pathlib import Path
 
 import streamlit as st
@@ -12,6 +18,8 @@ from document_analyst.config import (
     save_settings,
 )
 from document_analyst.services.rag import RagService
+
+SERVICE_CACHE_VERSION = "model-download-progress-v1"
 
 
 def run() -> None:
@@ -34,7 +42,10 @@ def run() -> None:
         st.session_state.show_empty_state_dialog = True
 
     settings: AppSettings = st.session_state.settings
-    service = RagService(settings)
+    service = _cached_service(
+        json.dumps(asdict(settings), sort_keys=True),
+        SERVICE_CACHE_VERSION,
+    )
     stats = service.stats()
 
     if stats["documents"] > 0 or stats["chunks"] > 0:
@@ -232,8 +243,13 @@ def _chat_tab(service: RagService) -> None:
                 st.markdown(prompt)
 
             with st.chat_message("assistant"):
-                with st.spinner("Searching your local index and generating a response..."):
-                    result = service.answer_question(prompt, st.session_state.messages[:-1])
+                try:
+                    with st.spinner("Searching your local index and generating a response..."):
+                        result = service.answer_question(prompt, st.session_state.messages[:-1])
+                except (OSError, RuntimeError, ValueError) as exc:
+                    st.error(f"Could not answer the question: {exc}")
+                    st.session_state.messages.pop()
+                    return
                 st.markdown(result.answer)
                 with st.expander("Sources", expanded=True):
                     for source in result.sources:
@@ -273,8 +289,12 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
             settings.documents_dir = directory.strip()
             save_settings(settings)
             st.session_state.settings = settings
-            with st.spinner("Parsing files, chunking semantically, embedding, and writing to Chroma..."):
-                result = service.index_documents(settings.documents_dir, replace_existing=replace_existing)
+            try:
+                with st.spinner("Parsing files, chunking semantically, embedding, and writing to Chroma..."):
+                    result = service.index_documents(settings.documents_dir, replace_existing=replace_existing)
+            except (OSError, RuntimeError, ValueError) as exc:
+                st.error(f"Indexing failed: {exc}")
+                return
             st.success(f"Indexed {result.document_count} documents into {result.chunk_count} chunks.")
             for warning in result.warnings:
                 st.warning(warning)
@@ -301,12 +321,14 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
         return
 
     for item in docs:
+        document_name = html.escape(str(item["document_name"]))
+        source_path = html.escape(str(item["source_path"]))
         with st.container():
             st.markdown(
                 f"""
                 <div class="source-card">
-                    <strong>{item["document_name"]}</strong><br/>
-                    <span class="muted">{item["source_path"]}</span><br/>
+                    <strong>{document_name}</strong><br/>
+                    <span class="muted">{source_path}</span><br/>
                     <span class="accent">{item["chunks"]} chunks</span>
                 </div>
                 """,
@@ -332,8 +354,35 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         """
     )
     if st.button("Download Selected Models", use_container_width=True):
-        with st.spinner("Downloading models into the local models folder..."):
-            embedding_dir, llm_path = service.download_models()
+        overall_progress = st.progress(0, text="Preparing model downloads…")
+        file_progress = st.progress(0, text="Waiting for the first file…")
+
+        def update_download_progress(
+            phase: str, description: str, downloaded: int, total: int | None
+        ) -> None:
+            phase_number = 1 if phase == "embeddings" else 2
+            phase_name = "Embedding model" if phase == "embeddings" else "Language model"
+            file_fraction = min(downloaded / total, 1.0) if total and total > 0 else 0.0
+            overall_fraction = ((phase_number - 1) + file_fraction) / 2
+            overall_progress.progress(
+                overall_fraction,
+                text=f"Step {phase_number} of 2: {phase_name}",
+            )
+            size_text = _format_download_size(downloaded, total)
+            file_progress.progress(
+                file_fraction,
+                text=f"{description} · {size_text}",
+            )
+
+        try:
+            embedding_dir, llm_path = _download_models_with_updates(
+                service, update_download_progress
+            )
+        except Exception as exc:  # Hugging Face exposes several transport-specific errors.
+            st.error(f"Model download failed: {exc}")
+            return
+        overall_progress.progress(1.0, text="Both models are ready")
+        file_progress.progress(1.0, text="Download complete")
         st.success(f"Models ready.\nEmbedding model: {embedding_dir}\nLLM: {llm_path}")
 
     st.write("")
@@ -406,13 +455,17 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
 
 
 def _source_card(source) -> None:
+    source_id = html.escape(str(source.source_id))
+    document_name = html.escape(str(source.document_name))
+    source_path = html.escape(str(source.source_path))
+    source_text = html.escape(str(source.text))
     st.markdown(
         f"""
         <div class="source-card">
-            <strong>[{source.source_id}] {source.document_name}</strong><br/>
-            <span class="muted">{source.source_path}</span><br/>
+            <strong>[{source_id}] {document_name}</strong><br/>
+            <span class="muted">{source_path}</span><br/>
             <span class="accent">Page {source.approx_page} • score {source.score:.3f}</span>
-            <p style="margin:0.6rem 0 0 0;">{source.text}</p>
+            <p style="margin:0.6rem 0 0 0;">{source_text}</p>
         </div>
         """,
         unsafe_allow_html=True,
@@ -423,3 +476,58 @@ def _repo_options(defaults: list[str], current_value: str) -> list[str]:
     if current_value in defaults:
         return defaults
     return [current_value, *defaults]
+
+
+def _format_download_size(downloaded: int, total: int | None) -> str:
+    def readable(value: int) -> str:
+        size = float(value)
+        for unit in ("B", "KB", "MB", "GB", "TB"):
+            if size < 1024 or unit == "TB":
+                return f"{size:.1f} {unit}"
+            size /= 1024
+        return f"{size:.1f} TB"
+
+    if total and total > 0:
+        return f"{readable(downloaded)} / {readable(total)} ({downloaded / total:.0%})"
+    return f"{readable(downloaded)} downloaded"
+
+
+def _download_models_with_updates(service: RagService, update) -> tuple[str, str]:
+    """Download off-thread while applying Streamlit updates on the script thread."""
+    events: queue.Queue[tuple[str, str, int, int | None]] = queue.Queue()
+    result: list[tuple[str, str]] = []
+    failure: list[Exception] = []
+
+    def collect(phase: str, description: str, downloaded: int, total: int | None) -> None:
+        events.put((phase, description, downloaded, total))
+
+    def download() -> None:
+        try:
+            result.append(service.download_models(progress=collect))
+        except Exception as exc:  # passed back to the main Streamlit thread
+            failure.append(exc)
+
+    worker = threading.Thread(target=download, name="model-download", daemon=True)
+    worker.start()
+    while worker.is_alive() or not events.empty():
+        try:
+            update(*events.get(timeout=0.1))
+        except queue.Empty:
+            time.sleep(0.05)
+    worker.join()
+    if failure:
+        raise failure[0]
+    if not result:
+        raise RuntimeError("Model download ended without a result.")
+    return result[0]
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_service(settings_json: str, cache_version: str) -> RagService:
+    """Keep native handles stable while invalidating incompatible old services."""
+    _ = cache_version
+    return RagService(AppSettings(**json.loads(settings_json)))
+
+
+if __name__ == "__main__":
+    run()

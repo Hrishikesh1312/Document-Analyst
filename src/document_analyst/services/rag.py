@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from typing import TYPE_CHECKING, Any
 
-from llama_cpp import Llama
+if TYPE_CHECKING:
+    from llama_cpp import Llama
 
 from document_analyst.config import AppSettings
 from document_analyst.models import ChunkRecord, SourceRecord
 from document_analyst.services.chroma_store import ChromaStore
 from document_analyst.services.ingestion import DocumentIngestor
 from document_analyst.services.model_manager import ModelManager
+from document_analyst.services.model_manager import DownloadProgress
 
 
 @dataclass(slots=True)
@@ -38,9 +41,9 @@ class RagService:
         self._embedder = None
         self._llm = None
 
-    def download_models(self) -> tuple[str, str]:
-        embedding_dir = self.models.ensure_embedding_model()
-        llm_path = self.models.ensure_llm_model()
+    def download_models(self, progress: DownloadProgress | None = None) -> tuple[str, str]:
+        embedding_dir = self.models.ensure_embedding_model(progress=progress)
+        llm_path = self.models.ensure_llm_model(progress=progress)
         return str(embedding_dir), str(llm_path)
 
     def ensure_embedder(self):
@@ -48,7 +51,7 @@ class RagService:
             self._embedder = self.models.load_embedder(download_if_missing=True)
         return self._embedder
 
-    def ensure_llm(self) -> Llama:
+    def ensure_llm(self) -> Any:
         if self._llm is not None:
             return self._llm
 
@@ -57,6 +60,8 @@ class RagService:
             llm_path = self.models.ensure_llm_model()
 
         threads = max(2, (os.cpu_count() or 4) - 1)
+        from llama_cpp import Llama
+
         self._llm = Llama(
             model_path=str(llm_path),
             n_ctx=self.LLM_CONTEXT_WINDOW,
@@ -67,9 +72,13 @@ class RagService:
         return self._llm
 
     def index_documents(self, directory: str, replace_existing: bool = False) -> IndexResult:
-        embedder = self.ensure_embedder()
+        self.ensure_embedder()
         documents, warnings = self.ingestor.load_documents(directory)
+        if not documents:
+            return IndexResult(document_count=0, chunk_count=0, warnings=warnings)
         chunks = self.ingestor.build_chunks(documents, self._embed_texts)
+        if not chunks:
+            return IndexResult(document_count=len(documents), chunk_count=0, warnings=warnings)
         embeddings = self._embed_texts([chunk.text for chunk in chunks])
 
         if replace_existing:
@@ -82,8 +91,7 @@ class RagService:
         )
 
     def answer_question(self, question: str, history: list[dict[str, str]]) -> AnswerResult:
-        embedder = self.ensure_embedder()
-        _ = embedder
+        self.ensure_embedder()
         query_embedding = self._embed_texts([question])[0]
         sources = self.store.query(query_embedding, self.settings.top_k)
         if not sources:
@@ -174,7 +182,7 @@ class RagService:
 
     def _fit_prompt_to_context(
         self,
-        llm: Llama,
+        llm: Any,
         question: str,
         sources: list[SourceRecord],
         history: list[dict[str, str]],
@@ -217,7 +225,7 @@ class RagService:
             )
         return prompt
 
-    def _token_count(self, llm: Llama, text: str) -> int:
+    def _token_count(self, llm: Any, text: str) -> int:
         return len(llm.tokenize(text.encode("utf-8")))
 
     def _truncate_text(self, text: str, limit: int | None) -> str:

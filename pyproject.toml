@@ -3,16 +3,23 @@ name = "document-analyst"
 version = "0.1.0"
 description = "Privacy-first local document RAG app built with Streamlit."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10,<3.14"
 dependencies = [
-  "chromadb>=1.5.9",
-  "huggingface_hub>=1.14.0",
-  "llama-cpp-python>=0.3.22",
-  "pymupdf>=1.27.2.3",
-  "pytesseract>=0.3.10",
-  "sentence-transformers>=5.4.1",
-  "streamlit>=1.57.0",
+  "chromadb>=1.5,<2",
+  "huggingface_hub>=0.34,<2",
+  "llama-cpp-python>=0.3.16,<1",
+  "pillow>=10,<13",
+  "pymupdf>=1.24,<2",
+  "pytesseract>=0.3.10,<1",
+  "sentence-transformers>=3,<6",
+  "streamlit>=1.40,<2",
 ]
+
+[project.optional-dependencies]
+dev = ["pytest>=8,<10"]
+
+[project.scripts]
+document-analyst = "document_analyst.cli:main"
 
 [build-system]
 requires = ["setuptools>=68.0"]
@@ -23,3 +30,6 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

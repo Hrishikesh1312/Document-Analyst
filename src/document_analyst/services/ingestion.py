@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import re
+import os
+import hashlib
 from pathlib import Path
+from collections.abc import Callable
 
-import fitz
-import numpy as np
-from PIL import Image
+import pymupdf
 
 try:
     import pytesseract
@@ -23,12 +24,22 @@ class DocumentIngestor:
         self.max_size_bytes = settings.max_file_size_mb * 1024 * 1024
 
     def discover(self, directory: str) -> list[Path]:
-        root = Path(directory).expanduser()
-        if not root.exists():
+        if not directory.strip():
+            raise ValueError("Choose a documents folder before building the index.")
+        root = Path(directory).expanduser().resolve()
+        if not root.is_dir():
             raise FileNotFoundError(f"Directory not found: {root}")
-        return sorted(
-            path for path in root.rglob("*") if path.is_file() and path.suffix.lower() in self.supported_extensions
-        )
+        discovered: list[Path] = []
+        for current, directories, filenames in os.walk(root, followlinks=False):
+            directories[:] = sorted(
+                (name for name in directories if not (Path(current) / name).is_symlink()),
+                key=str.casefold,
+            )
+            for name in sorted(filenames, key=str.casefold):
+                path = Path(current) / name
+                if not path.is_symlink() and path.suffix.lower() in self.supported_extensions:
+                    discovered.append(path)
+        return discovered
 
     def load_documents(self, directory: str) -> tuple[list[DocumentRecord], list[str]]:
         documents: list[DocumentRecord] = []
@@ -39,7 +50,11 @@ class DocumentIngestor:
                 if path.stat().st_size > self.max_size_bytes:
                     warnings.append(f"Skipped {path.name}: larger than {self.settings.max_file_size_mb}MB")
                     continue
-                documents.append(self.load_document(path))
+                document = self.load_document(path)
+                if document.text:
+                    documents.append(document)
+                else:
+                    warnings.append(f"Skipped {path.name}: no readable text found")
             except Exception as exc:  # pragma: no cover - defensive runtime handling
                 warnings.append(f"Skipped {path.name}: {exc}")
             if self.settings.enable_ocr and pytesseract is None and not warned_about_ocr_runtime:
@@ -68,7 +83,7 @@ class DocumentIngestor:
     def build_chunks(
         self,
         documents: list[DocumentRecord],
-        embed_texts: callable,
+        embed_texts: Callable[[list[str]], list[list[float]]],
     ) -> list[ChunkRecord]:
         chunks: list[ChunkRecord] = []
         for document in documents:
@@ -85,7 +100,7 @@ class DocumentIngestor:
 
     def _read_pdf(self, path: Path) -> list[PageSpan]:
         spans: list[PageSpan] = []
-        with fitz.open(path) as doc:
+        with pymupdf.open(path) as doc:
             for index, page in enumerate(doc, start=1):
                 text = page.get_text("text").strip()
                 if self._should_run_ocr(text):
@@ -99,13 +114,15 @@ class DocumentIngestor:
     def _should_run_ocr(self, text: str) -> bool:
         return self.settings.enable_ocr and len(text.strip()) < self.settings.ocr_min_text_chars
 
-    def _ocr_page(self, page: fitz.Page) -> str:
+    def _ocr_page(self, page: pymupdf.Page) -> str:
         if pytesseract is None:
             return ""
+        from PIL import Image
+
         if self.settings.tesseract_cmd.strip():
             pytesseract.pytesseract.tesseract_cmd = self.settings.tesseract_cmd.strip()
 
-        matrix = fitz.Matrix(self.settings.ocr_zoom, self.settings.ocr_zoom)
+        matrix = pymupdf.Matrix(self.settings.ocr_zoom, self.settings.ocr_zoom)
         pix = page.get_pixmap(matrix=matrix, alpha=False)
         mode = "RGB" if pix.n < 4 else "RGBA"
         image = Image.frombytes(mode, [pix.width, pix.height], pix.samples)
@@ -113,7 +130,11 @@ class DocumentIngestor:
             image = image.convert("RGB")
         return pytesseract.image_to_string(image)
 
-    def _chunk_document(self, document: DocumentRecord, embed_texts: callable) -> list[ChunkRecord]:
+    def _chunk_document(
+        self,
+        document: DocumentRecord,
+        embed_texts: Callable[[list[str]], list[list[float]]],
+    ) -> list[ChunkRecord]:
         sentences, pages = self._split_sentences(document.page_spans)
         if not sentences:
             return []
@@ -130,7 +151,7 @@ class DocumentIngestor:
             if index > 0:
                 previous = sentence_embeddings[index - 1]
                 current = sentence_embeddings[index]
-                similarity = float(np.dot(previous, current))
+                similarity = sum(a * b for a, b in zip(previous, current))
 
             proposed_chars = current_chars + len(sentence) + 1
             semantic_break = similarity < self.settings.semantic_threshold and current_chars >= self.settings.chunk_overlap
@@ -142,7 +163,7 @@ class DocumentIngestor:
                     approx_page = current_pages[0] if current_pages else 1
                     chunks.append(
                         ChunkRecord(
-                            chunk_id=f"{document.source_path}::{sequence}",
+                            chunk_id=self._chunk_id(document.source_path, sequence),
                             source_path=document.source_path,
                             document_name=document.name,
                             text=chunk_text,
@@ -167,7 +188,7 @@ class DocumentIngestor:
         if final_text:
             chunks.append(
                 ChunkRecord(
-                    chunk_id=f"{document.source_path}::{sequence}",
+                    chunk_id=self._chunk_id(document.source_path, sequence),
                     source_path=document.source_path,
                     document_name=document.name,
                     text=final_text,
@@ -200,3 +221,9 @@ class DocumentIngestor:
             if total >= self.settings.chunk_overlap:
                 break
         return overlap
+
+    @staticmethod
+    def _chunk_id(source_path: str, sequence: int) -> str:
+        # Fixed-size IDs avoid backend limits and path separator differences.
+        digest = hashlib.sha256(source_path.encode("utf-8", errors="surrogatepass")).hexdigest()
+        return f"{digest}:{sequence}"
