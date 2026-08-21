@@ -39,6 +39,34 @@ class IngestionTests(unittest.TestCase):
         self.assertLess(len(chunks[0].chunk_id), 80)
         self.assertEqual(chunks[0].chunk_id, ingestor.build_chunks([document], embeddings)[0].chunk_id)
 
+    def test_chunking_progress_reports_each_document(self) -> None:
+        ingestor = DocumentIngestor(AppSettings(chunk_size=100, chunk_overlap=10))
+        documents = [
+            DocumentRecord(
+                source_path=f"/tmp/{name}", name=name, extension=".txt",
+                size_bytes=10, text="A sentence.",
+                page_spans=[PageSpan(1, "A sentence.")],
+            )
+            for name in ("first.txt", "second.txt")
+        ]
+        events: list[tuple[str, str, int, int, bool]] = []
+
+        ingestor.build_chunks(
+            documents,
+            lambda texts: [[1.0, 0.0] for _ in texts],
+            progress=lambda *event: events.append(event),
+        )
+
+        self.assertEqual(
+            events,
+            [
+                ("chunking", "first.txt", 1, 2, False),
+                ("chunking", "first.txt", 1, 2, True),
+                ("chunking", "second.txt", 2, 2, False),
+                ("chunking", "second.txt", 2, 2, True),
+            ],
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -357,12 +357,47 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
             settings.documents_dir = directory.strip()
             save_settings(settings)
             st.session_state.settings = settings
+            index_progress = st.progress(0.0, text="Preparing documents for indexing…")
+
+            def update_index_progress(
+                phase: str, item: str, current: int, total: int, complete: bool
+            ) -> None:
+                completed = current if complete else current - 1
+                item_fraction = completed / total if total else 0.0
+                ranges = {
+                    "reading": (0.0, 0.2),
+                    "chunking": (0.2, 0.55),
+                    "embedding": (0.55, 0.9),
+                    "writing": (0.9, 1.0),
+                }
+                start, end = ranges[phase]
+                fraction = start + ((end - start) * item_fraction)
+                labels = {
+                    "reading": "Reading",
+                    "chunking": "Chunking",
+                    "embedding": "Embedding",
+                    "writing": "Writing",
+                }
+                position = f" {current}/{total}" if total > 1 else ""
+                index_progress.progress(
+                    fraction,
+                    text=f"{labels[phase]}{position}: {item}",
+                )
+
             try:
                 with st.spinner("Parsing files, chunking semantically, embedding, and writing to Chroma..."):
-                    result = service.index_documents(settings.documents_dir, replace_existing=replace_existing)
+                    result = service.index_documents(
+                        settings.documents_dir,
+                        replace_existing=replace_existing,
+                        progress=update_index_progress,
+                    )
             except (OSError, RuntimeError, ValueError) as exc:
                 st.error(f"Indexing failed: {exc}")
                 return
+            if result.document_count:
+                index_progress.progress(1.0, text="Indexing complete")
+            else:
+                index_progress.progress(0.0, text="No readable documents found to index")
             st.success(f"Indexed {result.document_count} documents into {result.chunk_count} chunks.")
             for warning in result.warnings:
                 st.warning(warning)

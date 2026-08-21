@@ -16,6 +16,8 @@ except ImportError:  # pragma: no cover
 from document_analyst.config import AppSettings
 from document_analyst.models import ChunkRecord, DocumentRecord, PageSpan
 
+IndexProgress = Callable[[str, str, int, int, bool], None]
+
 
 class DocumentIngestor:
     def __init__(self, settings: AppSettings) -> None:
@@ -41,25 +43,33 @@ class DocumentIngestor:
                     discovered.append(path)
         return discovered
 
-    def load_documents(self, directory: str) -> tuple[list[DocumentRecord], list[str]]:
+    def load_documents(
+        self, directory: str, progress: IndexProgress | None = None
+    ) -> tuple[list[DocumentRecord], list[str]]:
         documents: list[DocumentRecord] = []
         warnings: list[str] = []
         warned_about_ocr_runtime = False
-        for path in self.discover(directory):
+        paths = self.discover(directory)
+        total = len(paths)
+        for index, path in enumerate(paths, start=1):
+            if progress:
+                progress("reading", path.name, index, total, False)
             try:
                 if path.stat().st_size > self.max_size_bytes:
                     warnings.append(f"Skipped {path.name}: larger than {self.settings.max_file_size_mb}MB")
-                    continue
-                document = self.load_document(path)
-                if document.text:
-                    documents.append(document)
                 else:
-                    warnings.append(f"Skipped {path.name}: no readable text found")
+                    document = self.load_document(path)
+                    if document.text:
+                        documents.append(document)
+                    else:
+                        warnings.append(f"Skipped {path.name}: no readable text found")
             except Exception as exc:  # pragma: no cover - defensive runtime handling
                 warnings.append(f"Skipped {path.name}: {exc}")
             if self.settings.enable_ocr and pytesseract is None and not warned_about_ocr_runtime:
                 warnings.append("OCR is enabled, but the `pytesseract` Python package is not available.")
                 warned_about_ocr_runtime = True
+            if progress:
+                progress("reading", path.name, index, total, True)
         return documents, warnings
 
     def load_document(self, path: Path) -> DocumentRecord:
@@ -84,10 +94,16 @@ class DocumentIngestor:
         self,
         documents: list[DocumentRecord],
         embed_texts: Callable[[list[str]], list[list[float]]],
+        progress: IndexProgress | None = None,
     ) -> list[ChunkRecord]:
         chunks: list[ChunkRecord] = []
-        for document in documents:
+        total = len(documents)
+        for index, document in enumerate(documents, start=1):
+            if progress:
+                progress("chunking", document.name, index, total, False)
             chunks.extend(self._chunk_document(document, embed_texts))
+            if progress:
+                progress("chunking", document.name, index, total, True)
         return chunks
 
     def _read_text(self, path: Path) -> str:

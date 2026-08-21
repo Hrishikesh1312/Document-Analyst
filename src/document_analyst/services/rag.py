@@ -12,6 +12,7 @@ from document_analyst.config import AppSettings
 from document_analyst.models import ChunkRecord, SourceRecord
 from document_analyst.services.chroma_store import ChromaStore
 from document_analyst.services.ingestion import DocumentIngestor
+from document_analyst.services.ingestion import IndexProgress
 from document_analyst.services.model_manager import ModelManager
 from document_analyst.services.model_manager import DownloadProgress
 
@@ -72,19 +73,32 @@ class RagService:
         )
         return self._llm
 
-    def index_documents(self, directory: str, replace_existing: bool = False) -> IndexResult:
+    def index_documents(
+        self,
+        directory: str,
+        replace_existing: bool = False,
+        progress: IndexProgress | None = None,
+    ) -> IndexResult:
         self.ensure_embedder()
-        documents, warnings = self.ingestor.load_documents(directory)
+        documents, warnings = self.ingestor.load_documents(directory, progress=progress)
         if not documents:
             return IndexResult(document_count=0, chunk_count=0, warnings=warnings)
-        chunks = self.ingestor.build_chunks(documents, self._embed_texts)
+        chunks = self.ingestor.build_chunks(documents, self._embed_texts, progress=progress)
         if not chunks:
             return IndexResult(document_count=len(documents), chunk_count=0, warnings=warnings)
+        if progress:
+            progress("embedding", f"{len(chunks)} chunks", 1, 1, False)
         embeddings = self._embed_texts([chunk.text for chunk in chunks])
+        if progress:
+            progress("embedding", f"{len(chunks)} chunks", 1, 1, True)
 
+        if progress:
+            progress("writing", "Chroma vector database", 1, 1, False)
         if replace_existing:
             self.store.reset()
         self.store.upsert_chunks(chunks, embeddings)
+        if progress:
+            progress("writing", "Chroma vector database", 1, 1, True)
         return IndexResult(
             document_count=len(documents),
             chunk_count=len(chunks),
