@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import gc
 import os
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -126,6 +127,12 @@ class RagService:
 
     def stats(self) -> dict[str, int]:
         return self.store.stats()
+
+    def unload_models(self) -> None:
+        """Release in-memory model handles before their files are removed."""
+        self._embedder = None
+        self._llm = None
+        gc.collect()
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         embedder = self.ensure_embedder()

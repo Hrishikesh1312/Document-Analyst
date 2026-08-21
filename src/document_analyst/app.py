@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import html
 import json
+import os
 import queue
+import shutil
 import threading
 import time
 from dataclasses import asdict
@@ -18,6 +20,7 @@ from document_analyst.config import (
     save_settings,
 )
 from document_analyst.services.rag import RagService
+from document_analyst.services.model_manager import discover_model_repositories
 
 SERVICE_CACHE_VERSION = "model-download-progress-v1"
 
@@ -40,6 +43,10 @@ def run() -> None:
         st.session_state.active_view = "Chat"
     if "show_empty_state_dialog" not in st.session_state:
         st.session_state.show_empty_state_dialog = True
+
+    reset_notice = st.session_state.pop("reset_notice", None)
+    if reset_notice:
+        st.toast(reset_notice, icon=":material/check_circle:")
 
     settings: AppSettings = st.session_state.settings
     service = _cached_service(
@@ -84,12 +91,59 @@ def _sidebar(settings: AppSettings, service: RagService) -> str:
         col1, col2 = st.columns(2)
         col1.metric("Docs", stats["documents"])
         col2.metric("Chunks", stats["chunks"])
-        st.caption("Fully local RAG with a darker single-theme interface and first-launch model downloads.")
-        if st.button("Clear Chat", use_container_width=True):
-            st.session_state.messages = []
-            st.session_state.sources_by_turn = {}
-            st.rerun()
+        st.caption("Ask questions, explore documents, and turn files into grounded answers.")
+        with st.container(key="sidebar_reset"):
+            if st.button(
+                "Reset",
+                icon=":material/restart_alt:",
+                use_container_width=True,
+                type="secondary",
+            ):
+                _reset_dialog(service)
     return active_view
+
+
+@st.dialog("Reset application data")
+def _reset_dialog(service: RagService) -> None:
+    st.warning("Choose what to clear. Deleted vector data and model files cannot be recovered.")
+    clear_vector_db = st.checkbox("Vector database", value=False)
+    clear_chat = st.checkbox("Chat history", value=False)
+    clear_models = st.checkbox("Downloaded local models", value=False)
+
+    cancel, confirm = st.columns(2)
+    with cancel:
+        if st.button("Cancel", use_container_width=True):
+            st.rerun()
+    with confirm:
+        selected = clear_vector_db or clear_chat or clear_models
+        if st.button(
+            "Clear selected",
+            type="primary",
+            use_container_width=True,
+            disabled=not selected,
+        ):
+            cleared: list[str] = []
+            try:
+                if clear_vector_db:
+                    service.store.reset()
+                    cleared.append("vector database")
+                if clear_chat:
+                    st.session_state.messages = []
+                    st.session_state.sources_by_turn = {}
+                    cleared.append("chat history")
+                if clear_models:
+                    service.unload_models()
+                    service.models.delete_downloaded_models()
+                    cleared.append("local models")
+            except OSError as exc:
+                st.error(f"Reset failed: {exc}")
+                return
+
+            _cached_service.clear()
+            if clear_vector_db:
+                st.session_state.show_empty_state_dialog = False
+            st.session_state.reset_notice = f"Cleared {', '.join(cleared)}."
+            st.rerun()
 
 
 def _inject_theme() -> None:
@@ -126,6 +180,20 @@ def _inject_theme() -> None:
         [data-testid="stSidebar"] {{
             background: #050b14;
             border-right: 1px solid {palette["border"]};
+        }}
+        [data-testid="stSidebarUserContent"] {{
+            min-height: 100%;
+            display: flex;
+            flex-direction: column;
+        }}
+        [data-testid="stSidebarUserContent"] > div {{
+            display: flex;
+            flex-direction: column;
+            flex: 1;
+        }}
+        [data-testid="stSidebar"] .st-key-sidebar_reset {{
+            margin-top: auto;
+            padding-top: 1rem;
         }}
         [data-testid="stChatMessage"] {{
             background: rgba(8, 17, 29, 0.72);
@@ -343,8 +411,23 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
 def _models_tab(settings: AppSettings, service: RagService) -> None:
     st.subheader("Model Downloads")
     local_llm = service.models.local_llm_model_path()
-    embedding_options = _repo_options(EMBEDDING_REPO_OPTIONS, settings.embeddings_repo)
-    llm_options = _repo_options(LLM_REPO_OPTIONS, settings.llm_repo)
+    catalog_warning = ""
+    try:
+        live_embeddings, live_llms = _cached_model_catalog()
+    except Exception as exc:  # The settings screen must remain usable offline.
+        live_embeddings, live_llms = [], []
+        catalog_warning = str(exc)
+    embedding_options = _repo_options(
+        live_embeddings or EMBEDDING_REPO_OPTIONS, settings.embeddings_repo
+    )
+    llm_options = _repo_options(live_llms or LLM_REPO_OPTIONS, settings.llm_repo)
+    if (
+        settings.enable_ocr
+        and not _tesseract_available(settings.tesseract_cmd)
+        and not st.session_state.get("ocr_setup_shown", False)
+    ):
+        st.session_state.ocr_setup_shown = True
+        _ocr_setup_dialog(settings.tesseract_cmd)
     st.markdown(
         f"""
         - Embedding model directory: `{settings.embeddings_dir}`
@@ -387,6 +470,10 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
 
     st.write("")
     st.subheader("Model Selection")
+    if catalog_warning:
+        st.info("Hugging Face is unavailable, so the built-in model catalog is being shown.")
+    else:
+        st.caption("This catalog is refreshed from public Hugging Face repositories every hour.")
     with st.form("settings-form"):
         embeddings_repo = st.selectbox(
             "Embedding model",
@@ -450,8 +537,65 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         settings.tesseract_cmd = tesseract_cmd.strip()
         save_settings(settings)
         st.session_state.settings = settings
+        if settings.enable_ocr and not _tesseract_available(settings.tesseract_cmd):
+            st.session_state.ocr_setup_shown = True
+            _ocr_setup_dialog(settings.tesseract_cmd)
+            return
         st.success("Settings saved.")
         st.rerun()
+
+
+def _tesseract_available(configured_command: str = "") -> bool:
+    command = configured_command.strip()
+    if not command:
+        return shutil.which("tesseract") is not None
+    candidate = Path(command).expanduser()
+    return (candidate.is_file() and os.access(candidate, os.X_OK)) or shutil.which(command) is not None
+
+
+@st.dialog("Tesseract OCR must be installed", width="large")
+def _ocr_setup_dialog(configured_command: str = "") -> None:
+    st.warning(
+        "OCR is enabled, but the Tesseract system executable could not be found. "
+        "The Python package alone is not enough; install Tesseract manually for your operating system."
+    )
+
+    windows, macos, linux = st.tabs(["Windows", "macOS", "Linux"])
+    with windows:
+        st.markdown(
+            """
+            1. Download and run a Tesseract installer from the
+               [UB Mannheim builds](https://github.com/UB-Mannheim/tesseract/wiki).
+            2. Add `C:\\Program Files\\Tesseract-OCR` to the Windows `Path`, then restart this app.
+            3. Alternatively, enter the full path to `tesseract.exe` in **Tesseract executable path**.
+            """
+        )
+    with macos:
+        st.markdown("Install with Homebrew, then restart this app:")
+        st.code("brew install tesseract", language="bash")
+    with linux:
+        st.markdown("For Ubuntu or Debian, install from the system package manager:")
+        st.code("sudo apt update\nsudo apt install tesseract-ocr", language="bash")
+        st.caption("For Fedora, Arch, or another distribution, install its `tesseract` package.")
+
+    st.markdown(
+        "See the [official Tesseract installation guide]"
+        "(https://tesseract-ocr.github.io/tessdoc/Installation.html) for other platforms and languages."
+    )
+    if configured_command.strip():
+        st.caption(f"Configured executable: `{configured_command.strip()}`")
+
+    recheck, close = st.columns(2)
+    with recheck:
+        if st.button("Check installation again", type="primary", use_container_width=True):
+            if _tesseract_available(configured_command):
+                st.session_state.ocr_setup_shown = False
+                st.toast("Tesseract is available. OCR is ready.", icon=":material/check_circle:")
+                st.rerun()
+            st.error("Tesseract still could not be found. Restart the app after installing it.")
+    with close:
+        if st.button("Close", use_container_width=True):
+            st.rerun()
 
 
 def _source_card(source) -> None:
@@ -476,6 +620,11 @@ def _repo_options(defaults: list[str], current_value: str) -> list[str]:
     if current_value in defaults:
         return defaults
     return [current_value, *defaults]
+
+
+@st.cache_data(ttl=3600, show_spinner=False)
+def _cached_model_catalog() -> tuple[list[str], list[str]]:
+    return discover_model_repositories(limit=5)
 
 
 def _format_download_size(downloaded: int, total: int | None) -> str:

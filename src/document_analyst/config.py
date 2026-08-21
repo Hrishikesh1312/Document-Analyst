@@ -37,10 +37,13 @@ EMBEDDING_REPO_OPTIONS = [
     "intfloat/e5-small-v2",
 ]
 LLM_REPO_OPTIONS = [
-    "lmstudio-community/Llama-3.2-1B-Instruct-GGUF",
     "lmstudio-community/Qwen2.5-1.5B-Instruct-GGUF",
-    "lmstudio-community/Phi-3.5-mini-instruct-GGUF",
+    "lmstudio-community/Qwen2.5-0.5B-Instruct-GGUF",
+    "lmstudio-community/Llama-3.2-1B-Instruct-GGUF",
 ]
+RETIRED_LLM_REPOS = {
+    "lmstudio-community/Phi-3.5-mini-instruct-GGUF": LLM_REPO_OPTIONS[0],
+}
 
 
 def repo_storage_name(repo_id: str) -> str:
@@ -76,6 +79,7 @@ class AppSettings:
     )
 
     def __post_init__(self) -> None:
+        self.llm_repo = RETIRED_LLM_REPOS.get(self.llm_repo, self.llm_repo)
         self.validate()
         sync_model_paths(self)
 

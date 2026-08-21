@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import logging
+import re
+import shutil
 import warnings
-from pathlib import Path
 from collections.abc import Callable
+from pathlib import Path
 from typing import Any
 
-from huggingface_hub import hf_hub_download, list_repo_files, snapshot_download
+from huggingface_hub import hf_hub_download, list_models, list_repo_files, snapshot_download
 from tqdm.auto import tqdm
 
 # `sentence-transformers` can trigger noisy upstream Transformers messages about
@@ -27,9 +29,51 @@ class _TransformersPathWarningFilter(logging.Filter):
 
 logging.getLogger("transformers").addFilter(_TransformersPathWarningFilter())
 
-from document_analyst.config import AppSettings
+from document_analyst.config import AppSettings, MODELS_DIR
 
 DownloadProgress = Callable[[str, str, int, int | None], None]
+
+
+def discover_model_repositories(limit: int = 5) -> tuple[list[str], list[str]]:
+    """Return a small, current catalog of public embedding and local GGUF models."""
+    embedding_models = list_models(
+        filter="sentence-transformers",
+        pipeline_tag="feature-extraction",
+        gated=False,
+        sort="downloads",
+        limit=limit,
+        token=False,
+    )
+    embeddings = [model.id for model in embedding_models if model.id]
+
+    gguf_models = list_models(
+        filter="gguf",
+        search="instruct",
+        gated=False,
+        sort="downloads",
+        limit=50,
+        token=False,
+    )
+    llms: list[str] = []
+    for model in gguf_models:
+        repo_id = model.id
+        if not repo_id or not _is_small_instruct_model(repo_id):
+            continue
+        try:
+            files = list_repo_files(repo_id, token=False)
+        except Exception:  # A repository can disappear while the catalog is loading.
+            continue
+        if any(filename.lower().endswith(".gguf") for filename in files):
+            llms.append(repo_id)
+        if len(llms) == limit:
+            break
+    return embeddings, llms
+
+
+def _is_small_instruct_model(repo_id: str) -> bool:
+    """Keep the UI catalog practical for CPU-based local inference."""
+    name = repo_id.lower()
+    return bool(re.search(r"(?:^|[-_/])(0[._]5|0[._]6|1|1[._]5|2|3)b(?:[-_/]|$)", name))
 
 
 def _progress_tqdm(progress: DownloadProgress, phase: str) -> type[tqdm]:
@@ -68,6 +112,7 @@ class ModelManager:
         snapshot_download(
             repo_id=self.settings.embeddings_repo,
             local_dir=str(target),
+            token=False,
             max_workers=1 if progress else 8,
             tqdm_class=_progress_tqdm(progress, "embeddings") if progress else None,
         )
@@ -86,7 +131,7 @@ class ModelManager:
                     progress("llm", "Already downloaded", 1, 1)
                 return target
 
-        repo_files = list_repo_files(self.settings.llm_repo)
+        repo_files = list_repo_files(self.settings.llm_repo, token=False)
         candidates = [name for name in repo_files if name.lower().endswith(".gguf")]
         if not candidates:
             raise FileNotFoundError(f"No GGUF files found in repo {self.settings.llm_repo}")
@@ -96,6 +141,7 @@ class ModelManager:
             repo_id=self.settings.llm_repo,
             filename=preferred,
             local_dir=str(llm_dir),
+            token=False,
             tqdm_class=_progress_tqdm(progress, "llm") if progress else None,
         )
         if progress:
@@ -126,6 +172,17 @@ class ModelManager:
         if not model_dir.exists():
             raise FileNotFoundError("Embedding model not found locally.")
         return SentenceTransformer(str(model_dir), device="cpu", local_files_only=True)
+
+    def delete_downloaded_models(self) -> None:
+        """Delete every model managed by this application, including old selections."""
+        models_dir = MODELS_DIR.resolve()
+        if models_dir.exists():
+            for item in models_dir.iterdir():
+                if item.is_dir() and not item.is_symlink():
+                    shutil.rmtree(item)
+                else:
+                    item.unlink(missing_ok=True)
+        models_dir.mkdir(parents=True, exist_ok=True)
 
     @staticmethod
     def _safe_model_path(directory: Path, filename: str) -> Path:
