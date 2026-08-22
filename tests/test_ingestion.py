@@ -4,6 +4,9 @@ import tempfile
 import unittest
 from pathlib import Path
 
+from docx import Document as WordDocument
+from pptx import Presentation
+
 from document_analyst.config import AppSettings
 from document_analyst.models import DocumentRecord, PageSpan
 from document_analyst.services.ingestion import DocumentIngestor
@@ -66,6 +69,39 @@ class IngestionTests(unittest.TestCase):
                 ("chunking", "second.txt", 2, 2, True),
             ],
         )
+
+    def test_docx_paragraphs_and_tables_are_extracted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "report.docx"
+            document = WordDocument()
+            document.add_paragraph("Quarterly summary.")
+            table = document.add_table(rows=1, cols=2)
+            table.cell(0, 0).text = "Revenue"
+            table.cell(0, 1).text = "$42"
+            document.save(path)
+
+            loaded = DocumentIngestor(AppSettings()).load_document(path)
+
+            self.assertIn("Quarterly summary.", loaded.text)
+            self.assertIn("Revenue | $42", loaded.text)
+            self.assertEqual(loaded.page_spans[0].page_number, 1)
+
+    def test_pptx_text_and_slide_numbers_are_extracted(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "deck.pptx"
+            presentation = Presentation()
+            first = presentation.slides.add_slide(presentation.slide_layouts[1])
+            first.shapes.title.text = "Overview"
+            first.placeholders[1].text = "First slide body"
+            second = presentation.slides.add_slide(presentation.slide_layouts[1])
+            second.shapes.title.text = "Details"
+            presentation.save(path)
+
+            loaded = DocumentIngestor(AppSettings()).load_document(path)
+
+            self.assertIn("Overview", loaded.text)
+            self.assertIn("Details", loaded.text)
+            self.assertEqual([span.page_number for span in loaded.page_spans], [1, 2])
 
 
 if __name__ == "__main__":

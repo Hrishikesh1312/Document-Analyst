@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
 
@@ -27,6 +28,12 @@ class IndexResult:
 @dataclass(slots=True)
 class AnswerResult:
     answer: str
+    sources: list[SourceRecord]
+
+
+@dataclass(slots=True)
+class AnswerStream:
+    chunks: Iterator[str]
     sources: list[SourceRecord]
 
 
@@ -105,23 +112,54 @@ class RagService:
             warnings=warnings,
         )
 
-    def answer_question(self, question: str, history: list[dict[str, str]]) -> AnswerResult:
+    def retrieve_sources(
+        self, question: str, source_paths: list[str] | None = None
+    ) -> list[SourceRecord]:
         self.ensure_embedder()
         query_embedding = self._embed_texts([question])[0]
-        sources = self.store.query(query_embedding, self.settings.top_k)
+        return self.store.query(
+            query_embedding,
+            self.settings.top_k,
+            source_paths=source_paths,
+            min_score=self.settings.retrieval_min_score,
+        )
+
+    def answer_question(
+        self,
+        question: str,
+        history: list[dict[str, str]],
+        source_paths: list[str] | None = None,
+    ) -> AnswerResult:
+        streamed = self.answer_question_stream(question, history, source_paths)
+        return AnswerResult(answer="".join(streamed.chunks), sources=streamed.sources)
+
+    def answer_question_stream(
+        self,
+        question: str,
+        history: list[dict[str, str]],
+        source_paths: list[str] | None = None,
+    ) -> AnswerStream:
+        sources = self.retrieve_sources(question, source_paths)
         if not sources:
-            return AnswerResult(
-                answer="I could not find relevant indexed content yet. Add documents in the Manage Documents tab and try again.",
+            message = (
+                "I could not find sufficiently relevant content in the selected documents. "
+                "Try different wording, select more documents, or lower the minimum relevance score in Models & Settings."
+            )
+            return AnswerStream(
+                chunks=iter([message]),
                 sources=[],
             )
 
-        prompt = self._build_prompt(question, sources, history)
         llm_path = self.models.local_llm_model_path()
         if llm_path is None:
-            text = self._fallback_answer(question, sources)
-        else:
-            llm = self.ensure_llm()
-            prompt = self._fit_prompt_to_context(llm, question, sources, history)
+            return AnswerStream(
+                chunks=iter([self._fallback_answer(question, sources)]), sources=sources
+            )
+
+        llm = self.ensure_llm()
+        prompt = self._fit_prompt_to_context(llm, question, sources, history)
+
+        def generate() -> Iterator[str]:
             response = llm.create_chat_completion(
                 messages=[
                     {"role": "system", "content": self.settings.system_prompt},
@@ -129,9 +167,17 @@ class RagService:
                 ],
                 temperature=0.2,
                 max_tokens=self.LLM_MAX_OUTPUT_TOKENS,
+                stream=True,
             )
-            text = response["choices"][0]["message"]["content"].strip()
-        return AnswerResult(answer=text, sources=sources)
+            for event in response:
+                choices = event.get("choices", [])
+                if not choices:
+                    continue
+                content = choices[0].get("delta", {}).get("content")
+                if content:
+                    yield str(content)
+
+        return AnswerStream(chunks=generate(), sources=sources)
 
     def indexed_documents(self) -> list[dict[str, object]]:
         return self.store.indexed_documents()

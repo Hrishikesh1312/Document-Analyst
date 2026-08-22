@@ -1,7 +1,7 @@
 # Document Analyst
 
-Document Analyst is a privacy-first local RAG application for PDFs, Markdown,
-and text files. It runs on macOS, Windows, and Linux and keeps documents,
+Document Analyst is a privacy-first local RAG application for PDF, DOCX, PPTX,
+Markdown, and text files. It runs on macOS, Windows, and Linux and keeps documents,
 embeddings, vector data, and inference on the local machine.
 
 ## What is portable now

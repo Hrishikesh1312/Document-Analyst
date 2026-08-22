@@ -62,6 +62,7 @@ class AppSettings:
     chunk_size: int = 500
     chunk_overlap: int = 100
     top_k: int = 4
+    retrieval_min_score: float = 0.25
     max_history_turns: int = 5
     max_file_size_mb: int = 50
     semantic_threshold: float = 0.5
@@ -75,7 +76,7 @@ class AppSettings:
         "inline using [S1], [S2], etc. Avoid making up facts."
     )
     supported_extensions: list[str] = field(
-        default_factory=lambda: [".pdf", ".md", ".markdown", ".txt"]
+        default_factory=lambda: [".docx", ".md", ".markdown", ".pdf", ".pptx", ".txt"]
     )
 
     def __post_init__(self) -> None:
@@ -87,6 +88,7 @@ class AppSettings:
         self.chunk_size = max(100, min(int(self.chunk_size), 20_000))
         self.chunk_overlap = max(0, min(int(self.chunk_overlap), self.chunk_size - 1))
         self.top_k = max(1, min(int(self.top_k), 50))
+        self.retrieval_min_score = max(-1.0, min(float(self.retrieval_min_score), 1.0))
         self.max_history_turns = max(0, min(int(self.max_history_turns), 50))
         self.max_file_size_mb = max(1, min(int(self.max_file_size_mb), 2_048))
         self.semantic_threshold = max(-1.0, min(float(self.semantic_threshold), 1.0))

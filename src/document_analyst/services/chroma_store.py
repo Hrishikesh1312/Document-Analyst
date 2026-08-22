@@ -66,14 +66,25 @@ class ChromaStore:
             if stale_ids:
                 self.collection.delete(ids=stale_ids)
 
-    def query(self, query_embedding: list[float], top_k: int) -> list[SourceRecord]:
+    def query(
+        self,
+        query_embedding: list[float],
+        top_k: int,
+        source_paths: list[str] | None = None,
+        min_score: float | None = None,
+    ) -> list[SourceRecord]:
         available = self.collection.count()
         if available == 0:
             return []
+        normalized_paths = sorted({path for path in (source_paths or []) if path})
+        if source_paths is not None and not normalized_paths:
+            return []
+        where = {"source_path": {"$in": normalized_paths}} if normalized_paths else None
         response = self.collection.query(
             query_embeddings=[query_embedding],
             n_results=min(max(1, top_k), available),
             include=["documents", "metadatas", "distances"],
+            where=where,
         )
         docs = response.get("documents", [[]])[0]
         metas = response.get("metadatas", [[]])[0]
@@ -83,9 +94,11 @@ class ChromaStore:
             if doc is None or meta is None or distance is None:
                 continue
             score = 1.0 - float(distance)
+            if min_score is not None and score < min_score:
+                continue
             sources.append(
                 SourceRecord(
-                    source_id=f"S{index}",
+                    source_id="",
                     document_name=str(meta.get("document_name", "Unknown")),
                     source_path=str(meta.get("source_path", "")),
                     text=doc,
@@ -93,6 +106,8 @@ class ChromaStore:
                     approx_page=int(meta.get("approx_page", 1)),
                 )
             )
+        for index, source in enumerate(sources, start=1):
+            source.source_id = f"S{index}"
         return sources
 
     def delete_document(self, source_path: str) -> None:

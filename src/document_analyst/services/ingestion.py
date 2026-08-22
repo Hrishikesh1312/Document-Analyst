@@ -7,6 +7,8 @@ from pathlib import Path
 from collections.abc import Callable
 
 import pymupdf
+from docx import Document as WordDocument
+from pptx import Presentation
 
 try:
     import pytesseract
@@ -77,6 +79,12 @@ class DocumentIngestor:
         if suffix == ".pdf":
             page_spans = self._read_pdf(path)
             text = "\n\n".join(page.text for page in page_spans)
+        elif suffix == ".docx":
+            page_spans = self._read_docx(path)
+            text = "\n\n".join(span.text for span in page_spans)
+        elif suffix == ".pptx":
+            page_spans = self._read_pptx(path)
+            text = "\n\n".join(span.text for span in page_spans)
         else:
             text = self._read_text(path)
             page_spans = [PageSpan(page_number=1, text=text)]
@@ -125,6 +133,40 @@ class DocumentIngestor:
                         text = ocr_text
                 if text:
                     spans.append(PageSpan(page_number=index, text=text))
+        return spans
+
+    def _read_docx(self, path: Path) -> list[PageSpan]:
+        document = WordDocument(path)
+        blocks: list[str] = []
+        blocks.extend(
+            paragraph.text.strip()
+            for paragraph in document.paragraphs
+            if paragraph.text.strip()
+        )
+        for table in document.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                if cells:
+                    blocks.append(" | ".join(cells))
+        text = "\n".join(blocks).strip()
+        return [PageSpan(page_number=1, text=text)] if text else []
+
+    def _read_pptx(self, path: Path) -> list[PageSpan]:
+        presentation = Presentation(path)
+        spans: list[PageSpan] = []
+        for slide_number, slide in enumerate(presentation.slides, start=1):
+            blocks: list[str] = []
+            for shape in slide.shapes:
+                text = getattr(shape, "text", "").strip()
+                if text:
+                    blocks.append(text)
+                if getattr(shape, "has_table", False):
+                    for row in shape.table.rows:
+                        cells = [cell.text.strip() for cell in row.cells if cell.text.strip()]
+                        if cells:
+                            blocks.append(" | ".join(cells))
+            if blocks:
+                spans.append(PageSpan(page_number=slide_number, text="\n".join(blocks)))
         return spans
 
     def _should_run_ocr(self, text: str) -> bool:

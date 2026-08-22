@@ -247,7 +247,7 @@ def _hero(service: RagService) -> None:
         <div class="hero-card">
             <h1 style="margin:0 0 0.4rem 0;">Document Analyst</h1>
             <p class="muted" style="margin:0 0 1rem 0;">
-                Privacy-first semantic search and local Q&A for PDFs, Markdown, and text files.
+                Privacy-first semantic search and local Q&A for PDF, DOCX, PPTX, Markdown, and text files.
                 Multi-turn chat, source grounding, Chroma persistence, and on-device GGUF inference.
             </p>
             <p style="margin:0;">
@@ -292,6 +292,10 @@ def _empty_state_dialog() -> None:
 
 
 def _chat_tab(service: RagService) -> None:
+    indexed_documents = service.indexed_documents()
+    document_labels = {
+        str(item["source_path"]): str(item["document_name"]) for item in indexed_documents
+    }
     left, right = st.columns([1.65, 1], gap="large")
     with left:
         for index, message in enumerate(st.session_state.messages):
@@ -301,8 +305,7 @@ def _chat_tab(service: RagService) -> None:
                     sources = st.session_state.sources_by_turn.get(index, [])
                     if sources:
                         with st.expander("Sources", expanded=False):
-                            for source in sources:
-                                _source_card(source)
+                            _sources_panel(sources, f"turn-{index}")
 
         prompt = st.chat_input("Ask about your indexed documents")
         if prompt:
@@ -313,21 +316,38 @@ def _chat_tab(service: RagService) -> None:
             with st.chat_message("assistant"):
                 try:
                     with st.spinner("Searching your local index and generating a response..."):
-                        result = service.answer_question(prompt, st.session_state.messages[:-1])
+                        selected_paths = st.session_state.get("chat_document_filter", [])
+                        source_paths = selected_paths or None
+                        result = service.answer_question_stream(
+                            prompt,
+                            st.session_state.messages[:-1],
+                            source_paths=source_paths,
+                        )
+                        answer = st.write_stream(result.chunks)
                 except (OSError, RuntimeError, ValueError) as exc:
                     st.error(f"Could not answer the question: {exc}")
                     st.session_state.messages.pop()
                     return
-                st.markdown(result.answer)
-                with st.expander("Sources", expanded=True):
-                    for source in result.sources:
-                        _source_card(source)
                 turn_index = len(st.session_state.messages)
-                st.session_state.messages.append({"role": "assistant", "content": result.answer})
+                with st.expander("Sources", expanded=True):
+                    _sources_panel(result.sources, f"turn-{turn_index}")
+                st.session_state.messages.append({"role": "assistant", "content": str(answer)})
                 st.session_state.sources_by_turn[turn_index] = result.sources
             st.rerun()
 
     with right:
+        st.markdown("#### Search scope")
+        st.multiselect(
+            "Documents",
+            options=list(document_labels),
+            format_func=lambda path: document_labels.get(path, Path(path).name),
+            placeholder="All indexed documents",
+            key="chat_document_filter",
+            help="Leave empty to search the entire index.",
+        )
+        st.caption(
+            f"Chunks below relevance {service.settings.retrieval_min_score:.2f} are excluded."
+        )
         st.markdown("#### How answers are built")
         st.markdown(
             """
@@ -412,6 +432,7 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
             - Overlap: `{settings.chunk_overlap}` chars
             - Semantic threshold: `{settings.semantic_threshold}`
             - Top-k retrieval: `{settings.top_k}`
+            - Minimum relevance: `{settings.retrieval_min_score:.2f}`
             - OCR fallback: `{"On" if settings.enable_ocr else "Off"}`
             """
         )
@@ -524,6 +545,14 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         )
         llm_filename = st.text_input("Preferred GGUF filename", value=settings.llm_filename)
         top_k = st.slider("Retrieved chunks", min_value=2, max_value=8, value=settings.top_k)
+        retrieval_min_score = st.slider(
+            "Minimum retrieval relevance",
+            min_value=-1.0,
+            max_value=1.0,
+            value=float(settings.retrieval_min_score),
+            step=0.05,
+            help="Chunks scoring below this cosine-similarity threshold are not sent to the language model.",
+        )
         max_history_turns = st.slider("Turns kept in prompt", min_value=2, max_value=10, value=settings.max_history_turns)
         semantic_threshold = st.slider(
             "Semantic chunking threshold",
@@ -564,6 +593,7 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         settings.llm_repo = llm_repo.strip()
         settings.llm_filename = "" if repo_changed and not llm_filename.strip() else llm_filename.strip()
         settings.top_k = int(top_k)
+        settings.retrieval_min_score = float(retrieval_min_score)
         settings.max_history_turns = int(max_history_turns)
         settings.semantic_threshold = float(semantic_threshold)
         settings.enable_ocr = bool(enable_ocr)
@@ -633,14 +663,27 @@ def _ocr_setup_dialog(configured_command: str = "") -> None:
             st.rerun()
 
 
-def _source_card(source) -> None:
+def _sources_panel(sources, anchor_prefix: str) -> None:
+    if not sources:
+        st.caption("No evidence passed the relevance threshold.")
+        return
+    links = " · ".join(
+        f"[{source.source_id}](#{anchor_prefix}-{source.source_id.lower()})" for source in sources
+    )
+    st.markdown(f"Jump to evidence: {links}")
+    for source in sources:
+        _source_card(source, anchor_prefix)
+
+
+def _source_card(source, anchor_prefix: str = "source") -> None:
     source_id = html.escape(str(source.source_id))
     document_name = html.escape(str(source.document_name))
     source_path = html.escape(str(source.source_path))
     source_text = html.escape(str(source.text))
+    anchor = html.escape(f"{anchor_prefix}-{str(source.source_id).lower()}", quote=True)
     st.markdown(
         f"""
-        <div class="source-card">
+        <div class="source-card" id="{anchor}">
             <strong>[{source_id}] {document_name}</strong><br/>
             <span class="muted">{source_path}</span><br/>
             <span class="accent">Page {source.approx_page} • score {source.score:.3f}</span>
