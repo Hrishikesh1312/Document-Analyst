@@ -4,6 +4,11 @@ Document Analyst is a privacy-first local RAG application for PDF, DOCX, PPTX,
 Markdown, and text files. It runs on macOS, Windows, and Linux and keeps documents,
 embeddings, vector data, and inference on the local machine.
 
+Retrieval combines semantic vector search with local BM25 keyword search, then
+reranks and diversifies the candidate pool before generation. An optional
+diagnostics panel exposes candidate scores, selected evidence, document
+coverage, filters, and retrieval timings.
+
 ## What is portable now
 
 - Runtime data uses the native per-user application-data location instead of

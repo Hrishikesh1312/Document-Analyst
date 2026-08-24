@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import gc
 import os
+import time
 from collections.abc import Iterator
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any
@@ -10,7 +11,7 @@ if TYPE_CHECKING:
     from llama_cpp import Llama
 
 from document_analyst.config import AppSettings
-from document_analyst.models import ChunkRecord, SourceRecord
+from document_analyst.models import ChunkRecord, RetrievalDiagnostics, SourceRecord
 from document_analyst.services.chroma_store import ChromaStore
 from document_analyst.services.ingestion import DocumentIngestor
 from document_analyst.services.ingestion import IndexProgress
@@ -29,12 +30,14 @@ class IndexResult:
 class AnswerResult:
     answer: str
     sources: list[SourceRecord]
+    diagnostics: RetrievalDiagnostics | None = None
 
 
 @dataclass(slots=True)
 class AnswerStream:
     chunks: Iterator[str]
     sources: list[SourceRecord]
+    diagnostics: RetrievalDiagnostics | None = None
 
 
 class RagService:
@@ -115,14 +118,39 @@ class RagService:
     def retrieve_sources(
         self, question: str, source_paths: list[str] | None = None
     ) -> list[SourceRecord]:
+        sources, _ = self.retrieve_with_diagnostics(question, source_paths)
+        return sources
+
+    def retrieve_with_diagnostics(
+        self, question: str, source_paths: list[str] | None = None
+    ) -> tuple[list[SourceRecord], RetrievalDiagnostics]:
+        retrieval_started = time.perf_counter()
+        embedding_started = time.perf_counter()
         self.ensure_embedder()
         query_embedding = self._embed_texts([question])[0]
-        return self.store.query(
+        embedding_ms = (time.perf_counter() - embedding_started) * 1000
+        result = self.store.hybrid_query(
+            question,
             query_embedding,
             self.settings.top_k,
             source_paths=source_paths,
             min_score=self.settings.retrieval_min_score,
         )
+        total_ms = (time.perf_counter() - retrieval_started) * 1000
+        diagnostics = RetrievalDiagnostics(
+            query=question,
+            scope=list(source_paths or []),
+            candidate_count=len(result.candidates),
+            selected_count=len(result.sources),
+            documents_covered=len({source.source_path for source in result.sources}),
+            embedding_ms=embedding_ms,
+            semantic_ms=result.semantic_ms,
+            lexical_ms=result.lexical_ms,
+            rerank_ms=result.rerank_ms,
+            total_ms=total_ms,
+            candidates=result.candidates,
+        )
+        return result.sources, diagnostics
 
     def answer_question(
         self,
@@ -131,7 +159,11 @@ class RagService:
         source_paths: list[str] | None = None,
     ) -> AnswerResult:
         streamed = self.answer_question_stream(question, history, source_paths)
-        return AnswerResult(answer="".join(streamed.chunks), sources=streamed.sources)
+        return AnswerResult(
+            answer="".join(streamed.chunks),
+            sources=streamed.sources,
+            diagnostics=streamed.diagnostics,
+        )
 
     def answer_question_stream(
         self,
@@ -139,7 +171,7 @@ class RagService:
         history: list[dict[str, str]],
         source_paths: list[str] | None = None,
     ) -> AnswerStream:
-        sources = self.retrieve_sources(question, source_paths)
+        sources, diagnostics = self.retrieve_with_diagnostics(question, source_paths)
         if not sources:
             message = (
                 "I could not find sufficiently relevant content in the selected documents. "
@@ -148,12 +180,15 @@ class RagService:
             return AnswerStream(
                 chunks=iter([message]),
                 sources=[],
+                diagnostics=diagnostics,
             )
 
         llm_path = self.models.local_llm_model_path()
         if llm_path is None:
             return AnswerStream(
-                chunks=iter([self._fallback_answer(question, sources)]), sources=sources
+                chunks=iter([self._fallback_answer(question, sources)]),
+                sources=sources,
+                diagnostics=diagnostics,
             )
 
         llm = self.ensure_llm()
@@ -177,7 +212,7 @@ class RagService:
                 if content:
                     yield str(content)
 
-        return AnswerStream(chunks=generate(), sources=sources)
+        return AnswerStream(chunks=generate(), sources=sources, diagnostics=diagnostics)
 
     def indexed_documents(self) -> list[dict[str, object]]:
         return self.store.indexed_documents()

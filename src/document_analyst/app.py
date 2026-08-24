@@ -22,7 +22,7 @@ from document_analyst.config import (
 from document_analyst.services.rag import RagService
 from document_analyst.services.model_manager import discover_model_repositories
 
-SERVICE_CACHE_VERSION = "model-download-progress-v1"
+SERVICE_CACHE_VERSION = "hybrid-retrieval-v2"
 
 
 def run() -> None:
@@ -39,6 +39,10 @@ def run() -> None:
         st.session_state.messages = []
     if "sources_by_turn" not in st.session_state:
         st.session_state.sources_by_turn = {}
+    if "diagnostics_by_turn" not in st.session_state:
+        st.session_state.diagnostics_by_turn = {}
+    if "show_retrieval_diagnostics" not in st.session_state:
+        st.session_state.show_retrieval_diagnostics = False
     if "active_view" not in st.session_state:
         st.session_state.active_view = "Chat"
     if "show_empty_state_dialog" not in st.session_state:
@@ -130,6 +134,7 @@ def _reset_dialog(service: RagService) -> None:
                 if clear_chat:
                     st.session_state.messages = []
                     st.session_state.sources_by_turn = {}
+                    st.session_state.diagnostics_by_turn = {}
                     cleared.append("chat history")
                 if clear_models:
                     service.unload_models()
@@ -306,6 +311,10 @@ def _chat_tab(service: RagService) -> None:
                     if sources:
                         with st.expander("Sources", expanded=False):
                             _sources_panel(sources, f"turn-{index}")
+                    diagnostics = st.session_state.diagnostics_by_turn.get(index)
+                    if diagnostics and st.session_state.show_retrieval_diagnostics:
+                        with st.expander("Retrieval diagnostics", expanded=False):
+                            _diagnostics_panel(diagnostics)
 
         prompt = st.chat_input("Ask about your indexed documents")
         if prompt:
@@ -331,11 +340,22 @@ def _chat_tab(service: RagService) -> None:
                 turn_index = len(st.session_state.messages)
                 with st.expander("Sources", expanded=True):
                     _sources_panel(result.sources, f"turn-{turn_index}")
+                if result.diagnostics and st.session_state.show_retrieval_diagnostics:
+                    with st.expander("Retrieval diagnostics", expanded=True):
+                        _diagnostics_panel(result.diagnostics)
                 st.session_state.messages.append({"role": "assistant", "content": str(answer)})
                 st.session_state.sources_by_turn[turn_index] = result.sources
+                if result.diagnostics:
+                    st.session_state.diagnostics_by_turn[turn_index] = result.diagnostics
             st.rerun()
 
     with right:
+        st.markdown("#### Retrieval tools")
+        st.toggle(
+            "Show retrieval diagnostics",
+            key="show_retrieval_diagnostics",
+            help="Inspect hybrid-search candidates, score components, document coverage, and timing.",
+        )
         st.markdown("#### Search scope")
         st.multiselect(
             "Documents",
@@ -346,14 +366,15 @@ def _chat_tab(service: RagService) -> None:
             help="Leave empty to search the entire index.",
         )
         st.caption(
-            f"Chunks below relevance {service.settings.retrieval_min_score:.2f} are excluded."
+            f"Semantic floor {service.settings.retrieval_min_score:.2f}; strong BM25 matches can still qualify."
         )
         st.markdown("#### How answers are built")
         st.markdown(
             """
             1. Your question is embedded locally.
-            2. Chroma retrieves the most similar document chunks.
-            3. The local GGUF model answers with inline citations like `[S1]`.
+            2. Semantic and BM25 searches build a shared candidate pool.
+            3. Candidates are reranked and diversified across documents.
+            4. The local GGUF model answers with inline citations like `[S1]`.
             """
         )
         st.markdown("#### Chat behavior")
@@ -433,6 +454,7 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
             - Semantic threshold: `{settings.semantic_threshold}`
             - Top-k retrieval: `{settings.top_k}`
             - Minimum relevance: `{settings.retrieval_min_score:.2f}`
+            - Supported formats: `{", ".join(settings.supported_extensions)}`
             - OCR fallback: `{"On" if settings.enable_ocr else "Off"}`
             """
         )
@@ -551,7 +573,7 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
             max_value=1.0,
             value=float(settings.retrieval_min_score),
             step=0.05,
-            help="Chunks scoring below this cosine-similarity threshold are not sent to the language model.",
+            help="Minimum semantic similarity. Strong exact-term BM25 matches may still qualify.",
         )
         max_history_turns = st.slider("Turns kept in prompt", min_value=2, max_value=10, value=settings.max_history_turns)
         semantic_threshold = st.slider(
@@ -675,6 +697,40 @@ def _sources_panel(sources, anchor_prefix: str) -> None:
         _source_card(source, anchor_prefix)
 
 
+def _diagnostics_panel(diagnostics) -> None:
+    st.caption(f"Query: {diagnostics.query}")
+    scope = ", ".join(Path(path).name for path in diagnostics.scope) or "All indexed documents"
+    st.caption(f"Scope: {scope}")
+    first, second, third = st.columns(3)
+    first.metric("Candidates", diagnostics.candidate_count)
+    second.metric("Selected", diagnostics.selected_count)
+    third.metric("Documents", diagnostics.documents_covered)
+    st.markdown(
+        f"Embedding `{diagnostics.embedding_ms:.1f} ms` · "
+        f"semantic `{diagnostics.semantic_ms:.1f} ms` · "
+        f"BM25 `{diagnostics.lexical_ms:.1f} ms` · "
+        f"rerank `{diagnostics.rerank_ms:.1f} ms` · "
+        f"total `{diagnostics.total_ms:.1f} ms`"
+    )
+    rows = [
+        {
+            "Rank": item.rank,
+            "Decision": item.decision,
+            "Document": item.document_name,
+            "Page": item.approx_page,
+            "Semantic": round(item.semantic_score, 3),
+            "BM25": round(item.lexical_score, 3),
+            "Combined": round(item.combined_score, 3),
+            "Excerpt": item.excerpt,
+        }
+        for item in diagnostics.candidates
+    ]
+    if rows:
+        st.dataframe(rows, hide_index=True, width="stretch")
+    else:
+        st.info("No retrieval candidates matched the current scope and threshold.")
+
+
 def _source_card(source, anchor_prefix: str = "source") -> None:
     source_id = html.escape(str(source.source_id))
     document_name = html.escape(str(source.document_name))
@@ -686,7 +742,7 @@ def _source_card(source, anchor_prefix: str = "source") -> None:
         <div class="source-card" id="{anchor}">
             <strong>[{source_id}] {document_name}</strong><br/>
             <span class="muted">{source_path}</span><br/>
-            <span class="accent">Page {source.approx_page} • score {source.score:.3f}</span>
+            <span class="accent">Page {source.approx_page} • hybrid {source.score:.3f} • semantic {source.semantic_score:.3f} • BM25 {source.lexical_score:.3f}</span>
             <p style="margin:0.6rem 0 0 0;">{source_text}</p>
         </div>
         """,

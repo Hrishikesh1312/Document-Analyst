@@ -10,6 +10,8 @@ from typing import Any
 
 APP_NAME = "Document Analyst"
 APP_SLUG = "document-analyst"
+SETTINGS_SCHEMA_VERSION = 2
+OFFICE_EXTENSIONS = {".docx", ".pptx"}
 
 
 def _user_data_dir() -> Path:
@@ -52,6 +54,7 @@ def repo_storage_name(repo_id: str) -> str:
 
 @dataclass(slots=True)
 class AppSettings:
+    settings_version: int = SETTINGS_SCHEMA_VERSION
     documents_dir: str = ""
     chroma_dir: str = str(CHROMA_DIR)
     embeddings_repo: str = EMBEDDING_REPO_OPTIONS[0]
@@ -85,6 +88,7 @@ class AppSettings:
         sync_model_paths(self)
 
     def validate(self) -> None:
+        self.settings_version = SETTINGS_SCHEMA_VERSION
         self.chunk_size = max(100, min(int(self.chunk_size), 20_000))
         self.chunk_overlap = max(0, min(int(self.chunk_overlap), self.chunk_size - 1))
         self.top_k = max(1, min(int(self.top_k), 50))
@@ -115,13 +119,34 @@ def load_settings() -> AppSettings:
         raw: Any = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
         if not isinstance(raw, dict):
             raise ValueError("settings must contain a JSON object")
+        raw, migrated = _migrate_settings_payload(raw)
         allowed = {item.name for item in fields(AppSettings)}
         settings = AppSettings(**{key: value for key, value in raw.items() if key in allowed})
+        if migrated:
+            save_settings(settings)
     except (OSError, ValueError, TypeError, json.JSONDecodeError):
         _backup_invalid_settings()
         settings = AppSettings()
         save_settings(settings)
     return settings
+
+
+def _migrate_settings_payload(raw: dict[str, Any]) -> tuple[dict[str, Any], bool]:
+    """Upgrade persisted settings without discarding user-selected extensions."""
+    payload = dict(raw)
+    try:
+        version = int(payload.get("settings_version", 1))
+    except (TypeError, ValueError):
+        version = 1
+    migrated = version < SETTINGS_SCHEMA_VERSION
+    if version < 2:
+        configured = payload.get("supported_extensions", [])
+        extensions = {
+            str(value).lower() for value in configured
+        } if isinstance(configured, list) else set()
+        payload["supported_extensions"] = sorted(extensions | OFFICE_EXTENSIONS)
+    payload["settings_version"] = SETTINGS_SCHEMA_VERSION
+    return payload, migrated
 
 
 def save_settings(settings: AppSettings) -> None:

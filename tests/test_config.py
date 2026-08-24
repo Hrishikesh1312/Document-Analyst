@@ -2,7 +2,12 @@ from __future__ import annotations
 
 import unittest
 
-from document_analyst.config import AppSettings, repo_storage_name
+from document_analyst.config import (
+    SETTINGS_SCHEMA_VERSION,
+    AppSettings,
+    _migrate_settings_payload,
+    repo_storage_name,
+)
 
 
 class SettingsTests(unittest.TestCase):
@@ -21,6 +26,27 @@ class SettingsTests(unittest.TestCase):
         settings = AppSettings()
         self.assertIn(".docx", settings.supported_extensions)
         self.assertIn(".pptx", settings.supported_extensions)
+
+    def test_old_settings_are_migrated_to_office_formats(self) -> None:
+        payload, migrated = _migrate_settings_payload(
+            {"supported_extensions": [".pdf", ".txt"]}
+        )
+        self.assertTrue(migrated)
+        self.assertEqual(payload["settings_version"], SETTINGS_SCHEMA_VERSION)
+        self.assertEqual(
+            payload["supported_extensions"],
+            [".docx", ".pdf", ".pptx", ".txt"],
+        )
+
+    def test_current_settings_are_not_migrated_again(self) -> None:
+        payload, migrated = _migrate_settings_payload(
+            {
+                "settings_version": SETTINGS_SCHEMA_VERSION,
+                "supported_extensions": [".pdf"],
+            }
+        )
+        self.assertFalse(migrated)
+        self.assertEqual(payload["supported_extensions"], [".pdf"])
 
     def test_repo_storage_name_is_path_safe(self) -> None:
         name = repo_storage_name("owner/model name")
