@@ -398,6 +398,16 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
             settings.documents_dir = directory.strip()
             save_settings(settings)
             st.session_state.settings = settings
+            try:
+                legacy_presentations = service.ingestor.discover_legacy_presentations(
+                    settings.documents_dir
+                )
+            except (OSError, ValueError) as exc:
+                st.error(f"Indexing failed: {exc}")
+                return
+            if legacy_presentations:
+                _legacy_ppt_dialog(legacy_presentations)
+                return
             index_progress = st.progress(0.0, text="Preparing documents for indexing…")
 
             def update_index_progress(
@@ -638,6 +648,20 @@ def _tesseract_available(configured_command: str = "") -> bool:
         return shutil.which("tesseract") is not None
     candidate = Path(command).expanduser()
     return (candidate.is_file() and os.access(candidate, os.X_OK)) or shutil.which(command) is not None
+
+
+@st.dialog("Legacy PowerPoint files are not supported", width="large")
+def _legacy_ppt_dialog(paths: list[Path]) -> None:
+    st.warning(
+        "The legacy `.ppt` binary format cannot be indexed. Open each file in "
+        "Microsoft PowerPoint, LibreOffice Impress, or another compatible editor and "
+        "save it as a `.pptx` file, then build the index again."
+    )
+    st.markdown("Files that need conversion:")
+    for path in paths:
+        st.code(str(path), language=None)
+    if st.button("Close", type="primary", use_container_width=True):
+        st.rerun()
 
 
 @st.dialog("Tesseract OCR must be installed", width="large")

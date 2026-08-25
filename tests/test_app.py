@@ -49,6 +49,24 @@ class RetrievalDiagnosticsUiTests(unittest.TestCase):
         self.assertIn("BM25", markdown)
         self.assertIn("total", markdown)
 
+    def test_legacy_ppt_dialog_lists_files_and_conversion_guidance(self) -> None:
+        app = AppTest.from_string(
+            dedent(
+                """
+                from pathlib import Path
+                from document_analyst.app import _legacy_ppt_dialog
+
+                _legacy_ppt_dialog([Path("/documents/legacy-slides.ppt")])
+                """
+            ),
+            default_timeout=15,
+        ).run()
+
+        self.assertFalse(app.exception)
+        self.assertIn("legacy `.ppt`", app.warning[0].value)
+        self.assertIn("`.pptx`", app.warning[0].value)
+        self.assertEqual(app.code[0].value, "/documents/legacy-slides.ppt")
+
 
 if __name__ == "__main__":
     unittest.main()

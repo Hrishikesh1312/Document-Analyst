@@ -45,6 +45,25 @@ class DocumentIngestor:
                     discovered.append(path)
         return discovered
 
+    def discover_legacy_presentations(self, directory: str) -> list[Path]:
+        """Find unsupported binary PowerPoint files without following symlinks."""
+        if not directory.strip():
+            raise ValueError("Choose a documents folder before building the index.")
+        root = Path(directory).expanduser().resolve()
+        if not root.is_dir():
+            raise FileNotFoundError(f"Directory not found: {root}")
+        discovered: list[Path] = []
+        for current, directories, filenames in os.walk(root, followlinks=False):
+            directories[:] = sorted(
+                (name for name in directories if not (Path(current) / name).is_symlink()),
+                key=str.casefold,
+            )
+            for name in sorted(filenames, key=str.casefold):
+                path = Path(current) / name
+                if not path.is_symlink() and path.suffix.lower() == ".ppt":
+                    discovered.append(path)
+        return discovered
+
     def load_documents(
         self, directory: str, progress: IndexProgress | None = None
     ) -> tuple[list[DocumentRecord], list[str]]:

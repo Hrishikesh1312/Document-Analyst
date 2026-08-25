@@ -26,6 +26,23 @@ class IngestionTests(unittest.TestCase):
             paths = DocumentIngestor(AppSettings()).discover(str(root))
             self.assertEqual([item.name for item in paths], ["A.PDF", "notes.TXT"])
 
+    def test_legacy_ppt_files_are_detected_separately(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "legacy.PPT").write_bytes(b"legacy presentation")
+            (root / "modern.pptx").write_bytes(b"modern presentation")
+            try:
+                (root / "linked.ppt").symlink_to(root / "legacy.PPT")
+            except OSError:
+                pass
+
+            ingestor = DocumentIngestor(AppSettings())
+            legacy = ingestor.discover_legacy_presentations(str(root))
+            supported = ingestor.discover(str(root))
+
+            self.assertEqual([item.name for item in legacy], ["legacy.PPT"])
+            self.assertEqual([item.name for item in supported], ["modern.pptx"])
+
     def test_chunk_ids_are_fixed_size_and_deterministic(self) -> None:
         ingestor = DocumentIngestor(AppSettings(chunk_size=100, chunk_overlap=10))
         document = DocumentRecord(
