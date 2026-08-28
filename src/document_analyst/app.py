@@ -26,6 +26,15 @@ from document_analyst.services.conversation_export import conversation_markdown,
 from document_analyst.services.conversation_store import ConversationStore
 from document_analyst.services.rag import RagService
 from document_analyst.services.model_manager import discover_model_repositories
+from document_analyst.ui.components import (
+    app_header,
+    empty_state,
+    page_heading,
+    sidebar_brand,
+    sidebar_stats,
+)
+from document_analyst.ui.state import initialize_session_state
+from document_analyst.ui.theme import inject_theme
 
 SERVICE_CACHE_VERSION = "document-lifecycle-v3"
 
@@ -51,26 +60,10 @@ def run() -> None:
         initial_sidebar_state="expanded",
     )
 
+    inject_theme()
+    initialize_session_state()
     if "settings" not in st.session_state:
         st.session_state.settings = load_settings()
-    if "messages" not in st.session_state:
-        st.session_state.messages = []
-    if "sources_by_turn" not in st.session_state:
-        st.session_state.sources_by_turn = {}
-    if "diagnostics_by_turn" not in st.session_state:
-        st.session_state.diagnostics_by_turn = {}
-    if "show_retrieval_diagnostics" not in st.session_state:
-        st.session_state.show_retrieval_diagnostics = False
-    if "pinned_source_paths" not in st.session_state:
-        st.session_state.pinned_source_paths = []
-    if "excluded_source_paths" not in st.session_state:
-        st.session_state.excluded_source_paths = []
-    if "active_view" not in st.session_state:
-        st.session_state.active_view = "Chat"
-    if "show_empty_state_dialog" not in st.session_state:
-        st.session_state.show_empty_state_dialog = True
-    if "index_job" not in st.session_state:
-        st.session_state.index_job = None
 
     conversation_store = _cached_conversation_store()
     _initialize_conversation_state(conversation_store)
@@ -90,8 +83,12 @@ def run() -> None:
         st.session_state.show_empty_state_dialog = False
 
     active_view = _sidebar(settings, service, conversation_store)
-    _inject_theme()
-    _hero(service)
+    app_header(
+        active_view,
+        stats["documents"],
+        stats["chunks"],
+        bool(service.models.local_llm_model_path()),
+    )
 
     if (
         stats["documents"] == 0
@@ -100,9 +97,9 @@ def run() -> None:
     ):
         _empty_state_dialog()
 
-    if active_view == "Chat":
+    if active_view == "Ask":
         _chat_tab(service, conversation_store)
-    elif active_view == "Manage Documents":
+    elif active_view == "Library":
         _docs_tab(settings, service)
     else:
         _models_tab(settings, service)
@@ -112,19 +109,24 @@ def _sidebar(
     settings: AppSettings, service: RagService, conversation_store: ConversationStore
 ) -> str:
     with st.sidebar:
-        st.title("Document Analyst")
+        sidebar_brand()
+        views = ["Ask", "Library", "Settings"]
+        view_labels = {
+            "Ask": "⌕  Ask",
+            "Library": "▤  Library",
+            "Settings": "⚙  Settings",
+        }
         active_view = st.radio(
-            "Navigate",
-            ["Chat", "Manage Documents", "Models & Settings"],
-            index=["Chat", "Manage Documents", "Models & Settings"].index(st.session_state.active_view),
-            label_visibility="visible",
+            "Workspace navigation",
+            views,
+            index=views.index(st.session_state.active_view),
+            format_func=lambda view: view_labels[view],
+            label_visibility="collapsed",
         )
         st.session_state.active_view = active_view
         stats = service.stats()
-        col1, col2 = st.columns(2)
-        col1.metric("Docs", stats["documents"])
-        col2.metric("Chunks", stats["chunks"])
-        st.caption("Ask questions, explore documents, and turn files into grounded answers.")
+        sidebar_stats(stats["documents"], stats["chunks"])
+        st.caption("Files and inference remain on this device.")
         with st.container(key="sidebar_reset"):
             if st.button(
                 "Reset",
@@ -182,122 +184,6 @@ def _reset_dialog(service: RagService, conversation_store: ConversationStore) ->
             st.rerun()
 
 
-def _inject_theme() -> None:
-    palette = {
-        "bg": "#02060d",
-        "panel": "#08111d",
-        "card": "#0d1828",
-        "border": "#1d3147",
-        "text": "#edf4fb",
-        "muted": "#89a0b9",
-        "accent": "#81f0bc",
-    }
-    st.markdown(
-        f"""
-        <style>
-        .stApp {{
-            background:
-                radial-gradient(circle at top right, rgba(129, 240, 188, 0.08) 0%, transparent 26%),
-                radial-gradient(circle at 10% 20%, rgba(53, 112, 214, 0.10) 0%, transparent 22%),
-                linear-gradient(180deg, {palette["bg"]} 0%, {palette["bg"]} 100%);
-            color: {palette["text"]};
-        }}
-        .hero-card, .source-card, .metric-card {{
-            background: {palette["panel"]};
-            border: 1px solid {palette["border"]};
-            border-radius: 18px;
-            padding: 1rem 1.1rem;
-            box-shadow: 0 18px 40px rgba(0,0,0,0.22);
-        }}
-        .source-card {{
-            background: {palette["card"]};
-            margin-bottom: 0.8rem;
-        }}
-        [data-testid="stSidebar"] {{
-            background: #050b14;
-            border-right: 1px solid {palette["border"]};
-        }}
-        [data-testid="stSidebarUserContent"] {{
-            min-height: 100%;
-            display: flex;
-            flex-direction: column;
-        }}
-        [data-testid="stSidebarUserContent"] > div {{
-            display: flex;
-            flex-direction: column;
-            flex: 1;
-        }}
-        [data-testid="stSidebar"] .st-key-sidebar_reset {{
-            margin-top: auto;
-            padding-top: 1rem;
-        }}
-        [data-testid="stChatMessage"] {{
-            background: rgba(8, 17, 29, 0.72);
-            border: 1px solid rgba(29, 49, 71, 0.85);
-            border-radius: 18px;
-            padding: 0.4rem 0.8rem;
-        }}
-        [data-testid="stSidebar"] [role="radiogroup"] > label {{
-            background: #07101b;
-            border: 1px solid {palette["border"]};
-            border-radius: 14px;
-            padding: 0.35rem 0.65rem;
-            margin-bottom: 0.45rem;
-            width: 100%;
-            min-height: 48px;
-            box-sizing: border-box;
-        }}
-        [data-testid="stSidebar"] [role="radiogroup"] > label[data-baseweb="radio"] {{
-            display: flex;
-            align-items: center;
-            justify-content: flex-start;
-        }}
-        [data-testid="stSidebar"] [role="radiogroup"] > label:has(input:checked) {{
-            border-color: {palette["accent"]};
-            box-shadow: 0 0 0 1px rgba(129, 240, 188, 0.15);
-            background: rgba(16, 34, 53, 0.96);
-        }}
-        [data-testid="stSidebar"] [role="radiogroup"] p {{
-            color: {palette["text"]};
-            font-weight: 600;
-        }}
-        .muted {{
-            color: {palette["muted"]};
-        }}
-        .accent {{
-            color: {palette["accent"]};
-        }}
-        code {{
-            color: {palette["accent"]};
-        }}
-        </style>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def _hero(service: RagService) -> None:
-    stats = service.stats()
-    st.markdown(
-        f"""
-        <div class="hero-card">
-            <h1 style="margin:0 0 0.4rem 0;">Document Analyst</h1>
-            <p class="muted" style="margin:0 0 1rem 0;">
-                Privacy-first semantic search and local Q&A for PDF, DOCX, PPTX, Markdown, and text files.
-                Multi-turn chat, source grounding, Chroma persistence, and on-device GGUF inference.
-            </p>
-            <p style="margin:0;">
-                <span class="accent"><strong>{stats["documents"]}</strong> documents</span>
-                indexed across
-                <span class="accent"><strong>{stats["chunks"]}</strong> chunks</span>.
-            </p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-    st.write("")
-
-
 @st.dialog("No Documents Yet", width="large")
 def _empty_state_dialog() -> None:
     st.markdown(
@@ -305,20 +191,20 @@ def _empty_state_dialog() -> None:
         Your local index is empty right now.
 
         To get started:
-        1. Open `Models & Settings` and configure or download your embedding / GGUF models.
-        2. Open `Manage Documents` and add the local document folder you want to index.
-        3. Build the index, then come back to `Chat` to start asking questions.
+        1. Open `Settings` and configure or download your embedding / GGUF models.
+        2. Open `Library` and add the local document folder you want to index.
+        3. Build the index, then come back to `Ask` to start asking questions.
         """
     )
     col1, col2, col3 = st.columns(3)
     with col1:
-        if st.button("Open Models & Settings", use_container_width=True):
-            st.session_state.active_view = "Models & Settings"
+        if st.button("Open Settings", use_container_width=True):
+            st.session_state.active_view = "Settings"
             st.session_state.show_empty_state_dialog = False
             st.rerun()
     with col2:
-        if st.button("Open Manage Documents", use_container_width=True):
-            st.session_state.active_view = "Manage Documents"
+        if st.button("Open Library", use_container_width=True):
+            st.session_state.active_view = "Library"
             st.session_state.show_empty_state_dialog = False
             st.rerun()
     with col3:
@@ -328,12 +214,19 @@ def _empty_state_dialog() -> None:
 
 
 def _chat_tab(service: RagService, conversation_store: ConversationStore) -> None:
+    page_heading("Ask")
     indexed_documents = service.indexed_documents()
     document_labels = {
         str(item["source_path"]): str(item["document_name"]) for item in indexed_documents
     }
     left, right = st.columns([1.65, 1], gap="large")
     with left:
+        if not st.session_state.messages:
+            empty_state(
+                "Start with a question",
+                "Ask for an explanation, comparison, summary, or supporting passage from your indexed documents.",
+                "⌕",
+            )
         for index, message in enumerate(st.session_state.messages):
             with st.chat_message(message["role"]):
                 if message["role"] == "assistant":
@@ -440,6 +333,7 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
 
 
 def _docs_tab(settings: AppSettings, service: RagService) -> None:
+    page_heading("Library")
     active_job = st.session_state.get("index_job")
     indexing = bool(active_job and active_job.thread and active_job.thread.is_alive())
     col1, col2 = st.columns([1.3, 1], gap="large")
@@ -495,7 +389,11 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
     st.subheader("Indexed Documents")
     docs = service.document_statuses()
     if not docs:
-        st.info("No indexed documents yet.")
+        empty_state(
+            "Your library is empty",
+            "Choose a local folder above to build your private, searchable knowledge base.",
+            "▤",
+        )
         return
 
     for item in docs:
@@ -613,6 +511,7 @@ def _index_job_panel(service: RagService) -> None:
 
 
 def _models_tab(settings: AppSettings, service: RagService) -> None:
+    page_heading("Settings")
     st.subheader("Model Downloads")
     local_llm = service.models.local_llm_model_path()
     catalog_warning = ""
@@ -890,7 +789,6 @@ def _initialize_conversation_state(store: ConversationStore) -> None:
 
 def _load_conversation(conversation: dict) -> None:
     st.session_state.active_conversation_id = conversation["id"]
-    st.session_state.conversation_selector = conversation["id"]
     st.session_state.conversation_name = conversation.get("name", "New conversation")
     st.session_state.messages = list(conversation.get("messages", []))
     sources_by_turn: dict[int, list[SourceRecord]] = {}
@@ -930,7 +828,13 @@ def _conversation_panel(store: ConversationStore) -> None:
     if active_id not in ids:
         conversation = store.create()
         _load_conversation(conversation)
+        st.session_state.pending_conversation_id = conversation["id"]
         st.rerun()
+    pending_id = st.session_state.pop("pending_conversation_id", None)
+    if pending_id in ids:
+        # This runs before the selectbox is instantiated, which is the only safe
+        # point at which Streamlit permits programmatic widget-state changes.
+        st.session_state.conversation_selector = pending_id
     selected = st.selectbox(
         "Conversation",
         ids,
@@ -947,12 +851,16 @@ def _conversation_panel(store: ConversationStore) -> None:
     new_column, delete_column = st.columns(2)
     if new_column.button("New", use_container_width=True):
         _persist_current_conversation(store)
-        _load_conversation(store.create())
+        conversation = store.create()
+        _load_conversation(conversation)
+        st.session_state.pending_conversation_id = conversation["id"]
         st.rerun()
     if delete_column.button("Delete", use_container_width=True):
         store.delete(active_id)
         remaining = store.list()
-        _load_conversation(remaining[0] if remaining else store.create())
+        conversation = remaining[0] if remaining else store.create()
+        _load_conversation(conversation)
+        st.session_state.pending_conversation_id = conversation["id"]
         st.rerun()
 
     rename = st.text_input(
