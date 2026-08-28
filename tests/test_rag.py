@@ -27,7 +27,8 @@ class RagServiceTests(unittest.TestCase):
 
         self.service.store.hybrid_query.assert_called_once_with(
             "question", [1.0, 0.0], 3,
-            source_paths=["/docs/a.txt"], min_score=0.4
+            source_paths=["/docs/a.txt"], pinned_source_paths=None,
+            excluded_source_paths=None, min_score=0.4
         )
         self.assertEqual(sources, [])
         self.assertEqual(diagnostics.scope, ["/docs/a.txt"])

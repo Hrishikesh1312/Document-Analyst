@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import os
 import queue
+import re
 import shutil
 import threading
 import time
-from dataclasses import asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import streamlit as st
@@ -19,10 +21,26 @@ from document_analyst.config import (
     load_settings,
     save_settings,
 )
+from document_analyst.models import SourceRecord
+from document_analyst.services.conversation_export import conversation_markdown, conversation_pdf
+from document_analyst.services.conversation_store import ConversationStore
 from document_analyst.services.rag import RagService
 from document_analyst.services.model_manager import discover_model_repositories
 
-SERVICE_CACHE_VERSION = "hybrid-retrieval-v2"
+SERVICE_CACHE_VERSION = "document-lifecycle-v3"
+
+
+@dataclass
+class _IndexJob:
+    directory: str
+    replace_existing: bool
+    retry_failed_only: bool = False
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+    events: queue.Queue = field(default_factory=queue.Queue)
+    result: object | None = None
+    error: Exception | None = None
+    thread: threading.Thread | None = None
+    last_progress: tuple[str, str, int, int, bool] | None = None
 
 
 def run() -> None:
@@ -43,10 +61,19 @@ def run() -> None:
         st.session_state.diagnostics_by_turn = {}
     if "show_retrieval_diagnostics" not in st.session_state:
         st.session_state.show_retrieval_diagnostics = False
+    if "pinned_source_paths" not in st.session_state:
+        st.session_state.pinned_source_paths = []
+    if "excluded_source_paths" not in st.session_state:
+        st.session_state.excluded_source_paths = []
     if "active_view" not in st.session_state:
         st.session_state.active_view = "Chat"
     if "show_empty_state_dialog" not in st.session_state:
         st.session_state.show_empty_state_dialog = True
+    if "index_job" not in st.session_state:
+        st.session_state.index_job = None
+
+    conversation_store = _cached_conversation_store()
+    _initialize_conversation_state(conversation_store)
 
     reset_notice = st.session_state.pop("reset_notice", None)
     if reset_notice:
@@ -62,7 +89,7 @@ def run() -> None:
     if stats["documents"] > 0 or stats["chunks"] > 0:
         st.session_state.show_empty_state_dialog = False
 
-    active_view = _sidebar(settings, service)
+    active_view = _sidebar(settings, service, conversation_store)
     _inject_theme()
     _hero(service)
 
@@ -74,14 +101,16 @@ def run() -> None:
         _empty_state_dialog()
 
     if active_view == "Chat":
-        _chat_tab(service)
+        _chat_tab(service, conversation_store)
     elif active_view == "Manage Documents":
         _docs_tab(settings, service)
     else:
         _models_tab(settings, service)
 
 
-def _sidebar(settings: AppSettings, service: RagService) -> str:
+def _sidebar(
+    settings: AppSettings, service: RagService, conversation_store: ConversationStore
+) -> str:
     with st.sidebar:
         st.title("Document Analyst")
         active_view = st.radio(
@@ -103,12 +132,12 @@ def _sidebar(settings: AppSettings, service: RagService) -> str:
                 use_container_width=True,
                 type="secondary",
             ):
-                _reset_dialog(service)
+                _reset_dialog(service, conversation_store)
     return active_view
 
 
 @st.dialog("Reset application data")
-def _reset_dialog(service: RagService) -> None:
+def _reset_dialog(service: RagService, conversation_store: ConversationStore) -> None:
     st.warning("Choose what to clear. Deleted vector data and model files cannot be recovered.")
     clear_vector_db = st.checkbox("Vector database", value=False)
     clear_chat = st.checkbox("Chat history", value=False)
@@ -130,11 +159,13 @@ def _reset_dialog(service: RagService) -> None:
             try:
                 if clear_vector_db:
                     service.store.reset()
+                    service.manifest.reset()
                     cleared.append("vector database")
                 if clear_chat:
                     st.session_state.messages = []
                     st.session_state.sources_by_turn = {}
                     st.session_state.diagnostics_by_turn = {}
+                    _persist_current_conversation(conversation_store)
                     cleared.append("chat history")
                 if clear_models:
                     service.unload_models()
@@ -296,7 +327,7 @@ def _empty_state_dialog() -> None:
             st.rerun()
 
 
-def _chat_tab(service: RagService) -> None:
+def _chat_tab(service: RagService, conversation_store: ConversationStore) -> None:
     indexed_documents = service.indexed_documents()
     document_labels = {
         str(item["source_path"]): str(item["document_name"]) for item in indexed_documents
@@ -305,7 +336,12 @@ def _chat_tab(service: RagService) -> None:
     with left:
         for index, message in enumerate(st.session_state.messages):
             with st.chat_message(message["role"]):
-                st.markdown(message["content"])
+                if message["role"] == "assistant":
+                    st.markdown(_citation_links(message["content"], index))
+                    with st.expander("Copy answer with citations", expanded=False):
+                        st.code(message["content"], language=None)
+                else:
+                    st.markdown(message["content"])
                 if message["role"] == "assistant":
                     sources = st.session_state.sources_by_turn.get(index, [])
                     if sources:
@@ -331,6 +367,8 @@ def _chat_tab(service: RagService) -> None:
                             prompt,
                             st.session_state.messages[:-1],
                             source_paths=source_paths,
+                            pinned_source_paths=st.session_state.pinned_source_paths,
+                            excluded_source_paths=st.session_state.excluded_source_paths,
                         )
                         answer = st.write_stream(result.chunks)
                 except (OSError, RuntimeError, ValueError) as exc:
@@ -347,15 +385,35 @@ def _chat_tab(service: RagService) -> None:
                 st.session_state.sources_by_turn[turn_index] = result.sources
                 if result.diagnostics:
                     st.session_state.diagnostics_by_turn[turn_index] = result.diagnostics
+                if st.session_state.conversation_name == "New conversation":
+                    st.session_state.conversation_name = prompt.strip()[:60] or "New conversation"
+                _persist_current_conversation(conversation_store)
+                st.session_state.pinned_source_paths = []
+                st.session_state.excluded_source_paths = []
             st.rerun()
 
     with right:
+        _conversation_panel(conversation_store)
         st.markdown("#### Retrieval tools")
         st.toggle(
             "Show retrieval diagnostics",
             key="show_retrieval_diagnostics",
             help="Inspect hybrid-search candidates, score components, document coverage, and timing.",
         )
+        st.text_input(
+            "Search retrieved evidence",
+            key="evidence_search",
+            placeholder="Highlight or filter source passages",
+        )
+        if st.session_state.pinned_source_paths or st.session_state.excluded_source_paths:
+            st.caption(
+                f"Next response: {len(st.session_state.pinned_source_paths)} pinned, "
+                f"{len(st.session_state.excluded_source_paths)} excluded."
+            )
+            if st.button("Clear next-response source rules", use_container_width=True):
+                st.session_state.pinned_source_paths = []
+                st.session_state.excluded_source_paths = []
+                st.rerun()
         st.markdown("#### Search scope")
         st.multiselect(
             "Documents",
@@ -382,6 +440,8 @@ def _chat_tab(service: RagService) -> None:
 
 
 def _docs_tab(settings: AppSettings, service: RagService) -> None:
+    active_job = st.session_state.get("index_job")
+    indexing = bool(active_job and active_job.thread and active_job.thread.is_alive())
     col1, col2 = st.columns([1.3, 1], gap="large")
     with col1:
         st.subheader("Index a Folder")
@@ -392,7 +452,9 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
                 placeholder=str(Path.home()),
             )
             replace_existing = st.checkbox("Replace existing index contents", value=False)
-            submitted = st.form_submit_button("Build Index", use_container_width=True)
+            submitted = st.form_submit_button(
+                "Build Index", use_container_width=True, disabled=indexing
+            )
 
         if submitted:
             settings.documents_dir = directory.strip()
@@ -408,51 +470,11 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
             if legacy_presentations:
                 _legacy_ppt_dialog(legacy_presentations)
                 return
-            index_progress = st.progress(0.0, text="Preparing documents for indexing…")
-
-            def update_index_progress(
-                phase: str, item: str, current: int, total: int, complete: bool
-            ) -> None:
-                completed = current if complete else current - 1
-                item_fraction = completed / total if total else 0.0
-                ranges = {
-                    "reading": (0.0, 0.2),
-                    "chunking": (0.2, 0.55),
-                    "embedding": (0.55, 0.9),
-                    "writing": (0.9, 1.0),
-                }
-                start, end = ranges[phase]
-                fraction = start + ((end - start) * item_fraction)
-                labels = {
-                    "reading": "Reading",
-                    "chunking": "Chunking",
-                    "embedding": "Embedding",
-                    "writing": "Writing",
-                }
-                position = f" {current}/{total}" if total > 1 else ""
-                index_progress.progress(
-                    fraction,
-                    text=f"{labels[phase]}{position}: {item}",
-                )
-
-            try:
-                with st.spinner("Parsing files, chunking semantically, embedding, and writing to Chroma..."):
-                    result = service.index_documents(
-                        settings.documents_dir,
-                        replace_existing=replace_existing,
-                        progress=update_index_progress,
-                    )
-            except (OSError, RuntimeError, ValueError) as exc:
-                st.error(f"Indexing failed: {exc}")
-                return
-            if result.document_count:
-                index_progress.progress(1.0, text="Indexing complete")
-            else:
-                index_progress.progress(0.0, text="No readable documents found to index")
-            st.success(f"Indexed {result.document_count} documents into {result.chunk_count} chunks.")
-            for warning in result.warnings:
-                st.warning(warning)
+            _start_index_job(service, settings.documents_dir, replace_existing)
             st.rerun()
+
+        if st.session_state.index_job:
+            _index_job_panel(service)
 
     with col2:
         st.subheader("Index Settings")
@@ -471,7 +493,7 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
 
     st.write("")
     st.subheader("Indexed Documents")
-    docs = service.indexed_documents()
+    docs = service.document_statuses()
     if not docs:
         st.info("No indexed documents yet.")
         return
@@ -485,15 +507,109 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
                 <div class="source-card">
                     <strong>{document_name}</strong><br/>
                     <span class="muted">{source_path}</span><br/>
-                    <span class="accent">{item["chunks"]} chunks</span>
+                    <span class="accent">{item.get("chunks", 0)} chunks • {item.get("status", "indexed")}</span><br/>
+                    <span class="muted">Indexed: {item.get("indexed_at") or "Not yet"}</span>
                 </div>
                 """,
                 unsafe_allow_html=True,
             )
-            if st.button(f"Remove from index: {item['document_name']}", key=f"del-{item['source_path']}"):
+            if item.get("error"):
+                st.caption(f"Status detail: {item['error']}")
+            if item.get("duplicate_of"):
+                st.caption(f"Duplicate of: {item['duplicate_of']}")
+            if item.get("status") != "removed" and st.button(
+                f"Remove from index: {item['document_name']}", key=f"del-{item['source_path']}"
+            ):
                 service.delete_document(str(item["source_path"]))
                 st.success(f"Removed {item['document_name']} from the index.")
                 st.rerun()
+
+
+def _start_index_job(
+    service: RagService,
+    directory: str,
+    replace_existing: bool = False,
+    retry_failed_only: bool = False,
+) -> None:
+    current = st.session_state.get("index_job")
+    if current and current.thread and current.thread.is_alive():
+        raise RuntimeError("An indexing job is already running.")
+    job = _IndexJob(directory, replace_existing, retry_failed_only)
+
+    def progress(phase: str, item: str, current: int, total: int, complete: bool) -> None:
+        job.events.put((phase, item, current, total, complete))
+
+    def run_job() -> None:
+        try:
+            job.result = service.index_documents(
+                directory,
+                replace_existing=replace_existing,
+                progress=progress,
+                should_cancel=job.cancel_event.is_set,
+                retry_failed_only=retry_failed_only,
+            )
+        except Exception as exc:
+            job.error = exc
+
+    job.thread = threading.Thread(target=run_job, name="document-index", daemon=True)
+    st.session_state.index_job = job
+    job.thread.start()
+
+
+@st.fragment(run_every=0.5)
+def _index_job_panel(service: RagService) -> None:
+    job: _IndexJob | None = st.session_state.get("index_job")
+    if not job:
+        return
+    while not job.events.empty():
+        try:
+            job.last_progress = job.events.get_nowait()
+        except queue.Empty:
+            break
+    progress_value = 0.0
+    progress_text = "Preparing incremental index…"
+    if job.last_progress:
+        phase, item, current, total, complete = job.last_progress
+        ranges = {
+            "hashing": (0.0, 0.15),
+            "reading": (0.15, 0.30),
+            "chunking": (0.30, 0.50),
+            "embedding": (0.50, 0.85),
+            "writing": (0.85, 1.0),
+        }
+        start, end = ranges.get(phase, (0.0, 1.0))
+        completed = current if complete else max(0, current - 1)
+        progress_value = start + ((end - start) * (completed / total if total else 0.0))
+        progress_text = f"{phase.title()} {current}/{total}: {item}"
+    alive = bool(job.thread and job.thread.is_alive())
+    st.progress(min(progress_value, 1.0), text=progress_text)
+    if alive:
+        if st.button("Cancel indexing", type="secondary", use_container_width=True):
+            job.cancel_event.set()
+            st.warning("Cancellation requested. The current safe checkpoint will finish first.")
+        return
+    if job.error:
+        st.error(f"Indexing failed: {job.error}")
+    elif job.result:
+        result = job.result
+        if result.cancelled:
+            st.warning("Indexing was cancelled. Completed files remain safely indexed.")
+        else:
+            st.success("Incremental indexing complete.")
+        st.markdown(
+            f"Indexed `{result.document_count}` changed/new files into `{result.chunk_count}` chunks · "
+            f"unchanged `{result.unchanged_count}` · duplicates `{result.duplicate_count}` · "
+            f"failed `{result.failed_count}` · removed `{result.removed_count}`"
+        )
+        for warning in result.warnings:
+            st.warning(warning)
+        retry, dismiss = st.columns(2)
+        if result.failed_count and retry.button("Retry failed files", use_container_width=True):
+            _start_index_job(service, job.directory, retry_failed_only=True)
+            st.rerun(scope="app")
+        if dismiss.button("Dismiss", use_container_width=True):
+            st.session_state.index_job = None
+            st.rerun(scope="app")
 
 
 def _models_tab(settings: AppSettings, service: RagService) -> None:
@@ -713,12 +829,21 @@ def _sources_panel(sources, anchor_prefix: str) -> None:
     if not sources:
         st.caption("No evidence passed the relevance threshold.")
         return
+    search = st.session_state.get("evidence_search", "").strip()
+    visible_sources = [
+        source for source in sources
+        if not search or search.casefold() in source.text.casefold()
+    ]
+    if not visible_sources:
+        st.info(f"No retrieved evidence contains `{search}`.")
+        return
     links = " · ".join(
-        f"[{source.source_id}](#{anchor_prefix}-{source.source_id.lower()})" for source in sources
+        f"[{source.source_id}](#{anchor_prefix}-{source.source_id.lower()})"
+        for source in visible_sources
     )
     st.markdown(f"Jump to evidence: {links}")
-    for source in sources:
-        _source_card(source, anchor_prefix)
+    for card_index, source in enumerate(visible_sources):
+        _source_card(source, anchor_prefix, card_index, search)
 
 
 def _diagnostics_panel(diagnostics) -> None:
@@ -755,11 +880,128 @@ def _diagnostics_panel(diagnostics) -> None:
         st.info("No retrieval candidates matched the current scope and threshold.")
 
 
-def _source_card(source, anchor_prefix: str = "source") -> None:
+def _initialize_conversation_state(store: ConversationStore) -> None:
+    if st.session_state.get("conversation_loaded"):
+        return
+    conversations = store.list()
+    conversation = conversations[0] if conversations else store.create()
+    _load_conversation(conversation)
+
+
+def _load_conversation(conversation: dict) -> None:
+    st.session_state.active_conversation_id = conversation["id"]
+    st.session_state.conversation_selector = conversation["id"]
+    st.session_state.conversation_name = conversation.get("name", "New conversation")
+    st.session_state.messages = list(conversation.get("messages", []))
+    sources_by_turn: dict[int, list[SourceRecord]] = {}
+    for turn, sources in conversation.get("sources_by_turn", {}).items():
+        restored: list[SourceRecord] = []
+        for source in sources:
+            if isinstance(source, dict):
+                restored.append(SourceRecord(**source))
+        sources_by_turn[int(turn)] = restored
+    st.session_state.sources_by_turn = sources_by_turn
+    st.session_state.diagnostics_by_turn = {}
+    st.session_state.conversation_loaded = True
+
+
+def _persist_current_conversation(store: ConversationStore) -> None:
+    conversation_id = st.session_state.get("active_conversation_id")
+    if not conversation_id:
+        return
+    serialized_sources = {
+        str(turn): [asdict(source) for source in sources]
+        for turn, sources in st.session_state.sources_by_turn.items()
+    }
+    store.save_conversation(
+        conversation_id,
+        st.session_state.get("conversation_name", "New conversation"),
+        list(st.session_state.messages),
+        serialized_sources,
+    )
+
+
+def _conversation_panel(store: ConversationStore) -> None:
+    st.markdown("#### Conversations")
+    conversations = store.list()
+    names = {item["id"]: item["name"] for item in conversations}
+    ids = list(names)
+    active_id = st.session_state.active_conversation_id
+    if active_id not in ids:
+        conversation = store.create()
+        _load_conversation(conversation)
+        st.rerun()
+    selected = st.selectbox(
+        "Conversation",
+        ids,
+        index=ids.index(active_id),
+        format_func=lambda item: names[item],
+        key="conversation_selector",
+    )
+    if selected != active_id:
+        conversation = store.get(selected)
+        if conversation:
+            _load_conversation(conversation)
+            st.rerun()
+
+    new_column, delete_column = st.columns(2)
+    if new_column.button("New", use_container_width=True):
+        _persist_current_conversation(store)
+        _load_conversation(store.create())
+        st.rerun()
+    if delete_column.button("Delete", use_container_width=True):
+        store.delete(active_id)
+        remaining = store.list()
+        _load_conversation(remaining[0] if remaining else store.create())
+        st.rerun()
+
+    rename = st.text_input(
+        "Conversation name",
+        value=st.session_state.conversation_name,
+        key=f"conversation-name-{active_id}",
+    )
+    if st.button("Rename", use_container_width=True):
+        store.rename(active_id, rename)
+        st.session_state.conversation_name = rename.strip() or "Untitled conversation"
+        st.rerun()
+
+    markdown = conversation_markdown(
+        st.session_state.conversation_name,
+        st.session_state.messages,
+        st.session_state.sources_by_turn,
+    )
+    safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", st.session_state.conversation_name).strip("-")
+    safe_name = safe_name or "conversation"
+    export_markdown, export_pdf = st.columns(2)
+    export_markdown.download_button(
+        "Markdown",
+        markdown,
+        file_name=f"{safe_name}.md",
+        mime="text/markdown",
+        use_container_width=True,
+    )
+    export_pdf.download_button(
+        "PDF",
+        conversation_pdf(
+            st.session_state.conversation_name,
+            st.session_state.messages,
+            st.session_state.sources_by_turn,
+        ),
+        file_name=f"{safe_name}.pdf",
+        mime="application/pdf",
+        use_container_width=True,
+    )
+
+
+def _source_card(
+    source, anchor_prefix: str = "source", card_index: int = 0, search: str = ""
+) -> None:
     source_id = html.escape(str(source.source_id))
     document_name = html.escape(str(source.document_name))
     source_path = html.escape(str(source.source_path))
-    source_text = html.escape(str(source.text))
+    source_text = _highlight_text(
+        str(source.text), search or getattr(source, "matched_passage", "")
+    )
     anchor = html.escape(f"{anchor_prefix}-{str(source.source_id).lower()}", quote=True)
     st.markdown(
         f"""
@@ -771,6 +1013,52 @@ def _source_card(source, anchor_prefix: str = "source") -> None:
         </div>
         """,
         unsafe_allow_html=True,
+    )
+    action_key = hashlib.sha256(
+        f"{anchor_prefix}:{card_index}:{source.source_path}".encode("utf-8")
+    ).hexdigest()[:16]
+    open_column, pin_column, exclude_column = st.columns(3)
+    if Path(source.source_path).suffix.lower() == ".pdf":
+        target = Path(source.source_path).resolve().as_uri() + f"#page={source.approx_page}"
+        open_column.markdown(f"[Open PDF at page {source.approx_page}]({target})")
+    else:
+        open_column.markdown(f"[Open source file]({Path(source.source_path).resolve().as_uri()})")
+    if pin_column.button("Pin next", key=f"pin-{action_key}", use_container_width=True):
+        pinned = set(st.session_state.pinned_source_paths)
+        excluded = set(st.session_state.excluded_source_paths)
+        pinned.add(source.source_path)
+        excluded.discard(source.source_path)
+        st.session_state.pinned_source_paths = sorted(pinned)
+        st.session_state.excluded_source_paths = sorted(excluded)
+        st.rerun()
+    if exclude_column.button(
+        "Exclude next", key=f"exclude-{action_key}", use_container_width=True
+    ):
+        pinned = set(st.session_state.pinned_source_paths)
+        excluded = set(st.session_state.excluded_source_paths)
+        excluded.add(source.source_path)
+        pinned.discard(source.source_path)
+        st.session_state.pinned_source_paths = sorted(pinned)
+        st.session_state.excluded_source_paths = sorted(excluded)
+        st.rerun()
+
+
+def _highlight_text(text: str, search: str) -> str:
+    if not search:
+        return html.escape(text)
+    parts = re.split(f"({re.escape(search)})", text, flags=re.IGNORECASE)
+    return "".join(
+        f"<mark>{html.escape(part)}</mark>" if part.casefold() == search.casefold()
+        else html.escape(part)
+        for part in parts
+    )
+
+
+def _citation_links(answer: str, turn_index: int) -> str:
+    return re.sub(
+        r"\[(S\d+)\]",
+        lambda match: f"[[{match.group(1)}]](#turn-{turn_index}-{match.group(1).lower()})",
+        answer,
     )
 
 
@@ -834,6 +1122,11 @@ def _cached_service(settings_json: str, cache_version: str) -> RagService:
     """Keep native handles stable while invalidating incompatible old services."""
     _ = cache_version
     return RagService(AppSettings(**json.loads(settings_json)))
+
+
+@st.cache_resource(show_spinner=False)
+def _cached_conversation_store() -> ConversationStore:
+    return ConversationStore()
 
 
 if __name__ == "__main__":

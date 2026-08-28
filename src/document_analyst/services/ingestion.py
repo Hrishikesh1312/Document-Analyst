@@ -247,6 +247,7 @@ class DocumentIngestor:
                             sequence=sequence,
                             char_count=len(chunk_text),
                             approx_page=approx_page,
+                            file_hash=document.file_hash,
                         )
                     )
                     sequence += 1
@@ -272,6 +273,7 @@ class DocumentIngestor:
                     sequence=sequence,
                     char_count=len(final_text),
                     approx_page=current_pages[0] if current_pages else 1,
+                    file_hash=document.file_hash,
                 )
             )
         return chunks

@@ -9,6 +9,15 @@ reranks and diversifies the candidate pool before generation. An optional
 diagnostics panel exposes candidate scores, selected evidence, document
 coverage, filters, and retrieval timings.
 
+Indexing is incremental and records SHA-256 file hashes, timestamps, per-file
+status, duplicate relationships, failures, and removals. Long jobs run in the
+background with safe cancellation and failed-file retry controls.
+
+Chats are stored locally as named conversations and can be renamed, deleted,
+or exported with citations to Markdown and PDF. Source cards highlight the
+best-matching passage, link to PDF pages, support evidence search, and provide
+one-response pin/exclude controls.
+
 ## What is portable now
 
 - Runtime data uses the native per-user application-data location instead of

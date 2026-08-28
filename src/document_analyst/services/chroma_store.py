@@ -82,6 +82,8 @@ class ChromaStore:
                     "sequence": chunk.sequence,
                     "char_count": chunk.char_count,
                     "approx_page": chunk.approx_page,
+                    "file_hash": chunk.file_hash,
+                    "indexed_at": chunk.indexed_at,
                 }
                 for chunk in chunks
             ]
@@ -111,16 +113,25 @@ class ChromaStore:
         query_embedding: list[float],
         top_k: int,
         source_paths: list[str] | None = None,
+        pinned_source_paths: list[str] | None = None,
+        excluded_source_paths: list[str] | None = None,
         min_score: float | None = None,
         candidate_multiplier: int = 4,
     ) -> HybridQueryResult:
         available = self.collection.count()
         normalized_paths = sorted({path for path in (source_paths or []) if path})
+        pinned_paths = {path for path in (pinned_source_paths or []) if path}
+        excluded_paths = {path for path in (excluded_source_paths or []) if path}
         if available == 0 or (source_paths is not None and not normalized_paths):
             return HybridQueryResult([], [], 0.0, 0.0, 0.0)
 
         candidate_limit = min(available, max(top_k, top_k * candidate_multiplier))
-        where = {"source_path": {"$in": normalized_paths}} if normalized_paths else None
+        conditions: list[dict[str, object]] = []
+        if normalized_paths:
+            conditions.append({"source_path": {"$in": normalized_paths}})
+        if excluded_paths:
+            conditions.append({"source_path": {"$nin": sorted(excluded_paths)}})
+        where = conditions[0] if len(conditions) == 1 else {"$and": conditions} if conditions else None
         semantic_started = time.perf_counter()
         query_kwargs: dict[str, object] = {
             "query_embeddings": [query_embedding],
@@ -151,6 +162,11 @@ class ChromaStore:
         if normalized_paths:
             allowed = set(normalized_paths)
             corpus = [item for item in corpus if str(item.metadata.get("source_path", "")) in allowed]
+        if excluded_paths:
+            corpus = [
+                item for item in corpus
+                if str(item.metadata.get("source_path", "")) not in excluded_paths
+            ]
         corpus_by_id = {item.chunk_id: item for item in corpus}
         lexical_scores = self._bm25_scores(query_text, corpus)
         for chunk_id, score in sorted(
@@ -179,7 +195,7 @@ class ChromaStore:
             or item.lexical_score >= 0.25
         ]
         eligible_ids = {item.chunk.chunk_id for item in eligible}
-        selected = self._diversified_selection(eligible, top_k)
+        selected = self._diversified_selection(eligible, top_k, pinned_paths)
         selected_ids = {item.chunk.chunk_id for item in selected}
         rerank_ms = (time.perf_counter() - rerank_started) * 1000
 
@@ -193,6 +209,7 @@ class ChromaStore:
                 approx_page=int(item.chunk.metadata.get("approx_page", 1)),
                 semantic_score=item.semantic_score,
                 lexical_score=item.lexical_score,
+                matched_passage=self._supporting_passage(item.chunk.text, query_text),
             )
             for index, item in enumerate(selected, start=1)
         ]
@@ -315,10 +332,22 @@ class ChromaStore:
         } if maximum else {}
 
     @staticmethod
-    def _diversified_selection(candidates: list[_RankedChunk], top_k: int) -> list[_RankedChunk]:
+    def _diversified_selection(
+        candidates: list[_RankedChunk], top_k: int, pinned_paths: set[str] | None = None
+    ) -> list[_RankedChunk]:
         remaining = candidates.copy()
         selected: list[_RankedChunk] = []
         document_counts: Counter[str] = Counter()
+        for pinned_path in sorted(pinned_paths or set()):
+            matches = [
+                item for item in remaining
+                if str(item.chunk.metadata.get("source_path", "")) == pinned_path
+            ]
+            if matches and len(selected) < top_k:
+                best_pinned = max(matches, key=lambda item: item.combined_score)
+                selected.append(best_pinned)
+                remaining.remove(best_pinned)
+                document_counts[pinned_path] += 1
         while remaining and len(selected) < top_k:
             def adjusted(item: _RankedChunk) -> float:
                 source_path = str(item.chunk.metadata.get("source_path", ""))
@@ -347,6 +376,22 @@ class ChromaStore:
             if token not in cls.LEXICAL_STOP_WORDS
         ]
 
+    @classmethod
+    def _supporting_passage(cls, text: str, query: str) -> str:
+        query_terms = set(cls._tokenize(query))
+        passages = [part.strip() for part in re.split(r"(?<=[.!?])\s+", text) if part.strip()]
+        if not passages:
+            return text[:300]
+        if not query_terms:
+            return passages[0]
+        return max(
+            passages,
+            key=lambda passage: (
+                len(query_terms & set(cls._tokenize(passage))),
+                -len(passage),
+            ),
+        )
+
     def indexed_documents(self) -> list[dict[str, object]]:
         payload = self.collection.get(include=["metadatas"])
         documents: dict[str, dict[str, object]] = {}
@@ -358,6 +403,8 @@ class ChromaStore:
                     "document_name": meta["document_name"],
                     "source_path": source_path,
                     "chunks": 0,
+                    "file_hash": meta.get("file_hash", ""),
+                    "indexed_at": meta.get("indexed_at", ""),
                 },
             )
             item["chunks"] = int(item["chunks"]) + 1

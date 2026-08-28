@@ -17,6 +17,7 @@ class DocumentRecord:
     size_bytes: int
     text: str
     page_spans: list[PageSpan] = field(default_factory=list)
+    file_hash: str = ""
 
 
 @dataclass(slots=True)
@@ -28,6 +29,8 @@ class ChunkRecord:
     sequence: int
     char_count: int
     approx_page: int
+    file_hash: str = ""
+    indexed_at: str = ""
 
 
 @dataclass(slots=True)
@@ -40,6 +43,7 @@ class SourceRecord:
     approx_page: int
     semantic_score: float = 0.0
     lexical_score: float = 0.0
+    matched_passage: str = ""
 
 
 @dataclass(slots=True)

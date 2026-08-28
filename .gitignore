@@ -10,3 +10,4 @@ models
 models/embeddings/
 models/llm/
 *.egg-info/
+output/

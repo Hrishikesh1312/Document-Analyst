@@ -5,8 +5,17 @@ from textwrap import dedent
 
 from streamlit.testing.v1 import AppTest
 
+from document_analyst.app import _citation_links, _highlight_text
+
 
 class RetrievalDiagnosticsUiTests(unittest.TestCase):
+    def test_source_highlighting_and_citation_navigation(self) -> None:
+        highlighted = _highlight_text("Gradient descent updates weights.", "updates weights")
+        linked = _citation_links("The claim is supported [S2].", 7)
+
+        self.assertIn("<mark>updates weights</mark>", highlighted)
+        self.assertIn("(#turn-7-s2)", linked)
+
     def test_diagnostics_panel_renders_scores_scope_and_timings(self) -> None:
         app = AppTest.from_string(
             dedent(

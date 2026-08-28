@@ -96,6 +96,37 @@ class ChromaStoreTests(unittest.TestCase):
             )
             self.assertEqual(len(store._corpus()), 2)
 
+    def test_pinned_and_excluded_documents_affect_final_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ChromaStore(AppSettings(chroma_dir=directory))
+            store.upsert_chunks(
+                [
+                    ChunkRecord("a:0", "/docs/a.txt", "a.txt", "gradient training", 0, 17, 1),
+                    ChunkRecord("b:0", "/docs/b.txt", "b.txt", "gradient overview", 0, 17, 2),
+                    ChunkRecord("c:0", "/docs/c.txt", "c.txt", "gradient appendix", 0, 17, 3),
+                ],
+                [[1.0, 0.0], [0.8, 0.2], [0.7, 0.3]],
+            )
+
+            result = store.hybrid_query(
+                "gradient",
+                [1.0, 0.0],
+                2,
+                pinned_source_paths=["/docs/c.txt"],
+                excluded_source_paths=["/docs/a.txt"],
+            )
+
+            paths = [source.source_path for source in result.sources]
+            self.assertIn("/docs/c.txt", paths)
+            self.assertNotIn("/docs/a.txt", paths)
+
+    def test_best_matching_passage_is_attached_to_source(self) -> None:
+        passage = ChromaStore._supporting_passage(
+            "Neural networks contain layers. Backpropagation computes loss gradients. Optimizers update weights.",
+            "How are loss gradients computed?",
+        )
+        self.assertEqual(passage, "Backpropagation computes loss gradients.")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import os
 import time
 from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
 
 if TYPE_CHECKING:
     from llama_cpp import Llama
@@ -15,6 +17,7 @@ from document_analyst.models import ChunkRecord, RetrievalDiagnostics, SourceRec
 from document_analyst.services.chroma_store import ChromaStore
 from document_analyst.services.ingestion import DocumentIngestor
 from document_analyst.services.ingestion import IndexProgress
+from document_analyst.services.index_manifest import IndexManifest
 from document_analyst.services.model_manager import ModelManager
 from document_analyst.services.model_manager import DownloadProgress
 
@@ -24,6 +27,11 @@ class IndexResult:
     document_count: int
     chunk_count: int
     warnings: list[str]
+    unchanged_count: int = 0
+    duplicate_count: int = 0
+    failed_count: int = 0
+    removed_count: int = 0
+    cancelled: bool = False
 
 
 @dataclass(slots=True)
@@ -50,6 +58,7 @@ class RagService:
         self.models = ModelManager(settings)
         self.ingestor = DocumentIngestor(settings)
         self.store = ChromaStore(settings)
+        self.manifest = IndexManifest()
         self._embedder = None
         self._llm = None
 
@@ -88,41 +97,205 @@ class RagService:
         directory: str,
         replace_existing: bool = False,
         progress: IndexProgress | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+        retry_failed_only: bool = False,
     ) -> IndexResult:
-        self.ensure_embedder()
-        documents, warnings = self.ingestor.load_documents(directory, progress=progress)
-        if not documents:
-            return IndexResult(document_count=0, chunk_count=0, warnings=warnings)
-        chunks = self.ingestor.build_chunks(documents, self._embed_texts, progress=progress)
-        if not chunks:
-            return IndexResult(document_count=len(documents), chunk_count=0, warnings=warnings)
-        if progress:
-            progress("embedding", f"{len(chunks)} chunks", 1, 1, False)
-        embeddings = self._embed_texts([chunk.text for chunk in chunks])
-        if progress:
-            progress("embedding", f"{len(chunks)} chunks", 1, 1, True)
-
-        if progress:
-            progress("writing", "Chroma vector database", 1, 1, False)
         if replace_existing:
             self.store.reset()
-        self.store.upsert_chunks(chunks, embeddings)
-        if progress:
-            progress("writing", "Chroma vector database", 1, 1, True)
+            self.manifest.reset()
+
+        root = Path(directory).expanduser().resolve()
+        paths = self.ingestor.discover(directory)
+        entries = self.manifest.load()
+        warnings: list[str] = []
+        discovered_paths = {str(path.resolve()) for path in paths}
+        removed_count = 0
+        for source_path, entry in list(entries.items()):
+            try:
+                is_inside_root = Path(source_path).is_relative_to(root)
+            except (OSError, ValueError):
+                is_inside_root = False
+            if is_inside_root and source_path not in discovered_paths and entry.get("status") != "removed":
+                self.store.delete_document(source_path)
+                entry.update(status="removed", error="File no longer exists", updated_at=self.manifest.now())
+                removed_count += 1
+
+        total = len(paths)
+        indexed_count = unchanged_count = duplicate_count = failed_count = chunk_count = 0
+        cancelled = False
+        hashes: dict[str, str] = {}
+        for index, path in enumerate(paths, start=1):
+            if should_cancel and should_cancel():
+                cancelled = True
+                break
+            if progress:
+                progress("hashing", path.name, index, total, False)
+            try:
+                hashes[str(path.resolve())] = self._hash_file(path, should_cancel)
+            except RuntimeError as exc:
+                if "cancelled" not in str(exc).lower():
+                    raise
+                cancelled = True
+                break
+            if progress:
+                progress("hashing", path.name, index, total, True)
+
+        canonical_by_hash: dict[str, str] = {}
+        for path in paths:
+            source_path = str(path.resolve())
+            previous = entries.get(source_path, {})
+            current_hash = hashes.get(source_path)
+            if (
+                current_hash
+                and previous.get("status") == "indexed"
+                and previous.get("file_hash") == current_hash
+            ):
+                canonical_by_hash.setdefault(current_hash, source_path)
+        for index, path in enumerate(paths, start=1):
+            source_path = str(path.resolve())
+            if source_path not in hashes:
+                break
+            if should_cancel and should_cancel():
+                cancelled = True
+                break
+            file_hash = hashes[source_path]
+            previous = entries.get(source_path, {})
+            if retry_failed_only and previous.get("status") not in {"failed", "cancelled"}:
+                unchanged_count += 1
+                continue
+            duplicate_of = canonical_by_hash.get(file_hash)
+            if duplicate_of and duplicate_of != source_path:
+                self.store.delete_document(source_path)
+                entries[source_path] = self._manifest_entry(
+                    path, file_hash, "duplicate", duplicate_of=duplicate_of
+                )
+                duplicate_count += 1
+                self.manifest.save(entries)
+                continue
+            if (
+                not replace_existing
+                and previous.get("file_hash") == file_hash
+                and previous.get("status") == "indexed"
+            ):
+                unchanged_count += 1
+                canonical_by_hash.setdefault(file_hash, source_path)
+                continue
+
+            try:
+                if progress:
+                    progress("reading", path.name, index, total, False)
+                document = self.ingestor.load_document(path)
+                document.file_hash = file_hash
+                if progress:
+                    progress("reading", path.name, index, total, True)
+                if not document.text:
+                    raise ValueError("no readable text found")
+                chunks = self.ingestor.build_chunks([document], self._embed_texts)
+                if not chunks:
+                    raise ValueError("no searchable chunks were produced")
+                indexed_at = self.manifest.now()
+                for chunk in chunks:
+                    chunk.indexed_at = indexed_at
+                if progress:
+                    progress("embedding", path.name, index, total, False)
+                embeddings = self._embed_texts([chunk.text for chunk in chunks])
+                if progress:
+                    progress("embedding", path.name, index, total, True)
+                if should_cancel and should_cancel():
+                    entries[source_path] = self._manifest_entry(
+                        path, file_hash, "cancelled", error="Cancelled before database write"
+                    )
+                    cancelled = True
+                    self.manifest.save(entries)
+                    break
+                if progress:
+                    progress("writing", path.name, index, total, False)
+                self.store.upsert_chunks(chunks, embeddings)
+                if progress:
+                    progress("writing", path.name, index, total, True)
+                entries[source_path] = self._manifest_entry(
+                    path, file_hash, "indexed", chunks=len(chunks), indexed_at=indexed_at
+                )
+                canonical_by_hash[file_hash] = source_path
+                indexed_count += 1
+                chunk_count += len(chunks)
+            except Exception as exc:  # Keep other files indexable and record a retryable failure.
+                if previous.get("status") == "indexed" and previous.get("file_hash") != file_hash:
+                    self.store.delete_document(source_path)
+                entries[source_path] = self._manifest_entry(
+                    path, file_hash, "failed", error=str(exc)
+                )
+                warnings.append(f"Failed {path.name}: {exc}")
+                failed_count += 1
+            self.manifest.save(entries)
+
+        self.manifest.save(entries)
         return IndexResult(
-            document_count=len(documents),
-            chunk_count=len(chunks),
+            document_count=indexed_count,
+            chunk_count=chunk_count,
             warnings=warnings,
+            unchanged_count=unchanged_count,
+            duplicate_count=duplicate_count,
+            failed_count=failed_count,
+            removed_count=removed_count,
+            cancelled=cancelled,
         )
 
+    def _hash_file(
+        self, path: Path, should_cancel: Callable[[], bool] | None = None
+    ) -> str:
+        digest = hashlib.sha256()
+        with path.open("rb") as handle:
+            while block := handle.read(1024 * 1024):
+                if should_cancel and should_cancel():
+                    raise RuntimeError("Indexing cancelled while hashing")
+                digest.update(block)
+        return digest.hexdigest()
+
+    def _manifest_entry(
+        self,
+        path: Path,
+        file_hash: str,
+        status: str,
+        *,
+        chunks: int = 0,
+        error: str = "",
+        duplicate_of: str = "",
+        indexed_at: str = "",
+    ) -> dict[str, object]:
+        stat = path.stat()
+        return {
+            "document_name": path.name,
+            "source_path": str(path.resolve()),
+            "file_hash": file_hash,
+            "size_bytes": stat.st_size,
+            "modified_at": stat.st_mtime,
+            "indexed_at": indexed_at,
+            "updated_at": self.manifest.now(),
+            "status": status,
+            "chunks": chunks,
+            "error": error,
+            "duplicate_of": duplicate_of,
+        }
+
     def retrieve_sources(
-        self, question: str, source_paths: list[str] | None = None
+        self,
+        question: str,
+        source_paths: list[str] | None = None,
+        pinned_source_paths: list[str] | None = None,
+        excluded_source_paths: list[str] | None = None,
     ) -> list[SourceRecord]:
-        sources, _ = self.retrieve_with_diagnostics(question, source_paths)
+        sources, _ = self.retrieve_with_diagnostics(
+            question, source_paths, pinned_source_paths, excluded_source_paths
+        )
         return sources
 
     def retrieve_with_diagnostics(
-        self, question: str, source_paths: list[str] | None = None
+        self,
+        question: str,
+        source_paths: list[str] | None = None,
+        pinned_source_paths: list[str] | None = None,
+        excluded_source_paths: list[str] | None = None,
     ) -> tuple[list[SourceRecord], RetrievalDiagnostics]:
         retrieval_started = time.perf_counter()
         embedding_started = time.perf_counter()
@@ -134,6 +307,8 @@ class RagService:
             query_embedding,
             self.settings.top_k,
             source_paths=source_paths,
+            pinned_source_paths=pinned_source_paths,
+            excluded_source_paths=excluded_source_paths,
             min_score=self.settings.retrieval_min_score,
         )
         total_ms = (time.perf_counter() - retrieval_started) * 1000
@@ -157,8 +332,12 @@ class RagService:
         question: str,
         history: list[dict[str, str]],
         source_paths: list[str] | None = None,
+        pinned_source_paths: list[str] | None = None,
+        excluded_source_paths: list[str] | None = None,
     ) -> AnswerResult:
-        streamed = self.answer_question_stream(question, history, source_paths)
+        streamed = self.answer_question_stream(
+            question, history, source_paths, pinned_source_paths, excluded_source_paths
+        )
         return AnswerResult(
             answer="".join(streamed.chunks),
             sources=streamed.sources,
@@ -170,8 +349,12 @@ class RagService:
         question: str,
         history: list[dict[str, str]],
         source_paths: list[str] | None = None,
+        pinned_source_paths: list[str] | None = None,
+        excluded_source_paths: list[str] | None = None,
     ) -> AnswerStream:
-        sources, diagnostics = self.retrieve_with_diagnostics(question, source_paths)
+        sources, diagnostics = self.retrieve_with_diagnostics(
+            question, source_paths, pinned_source_paths, excluded_source_paths
+        )
         if not sources:
             message = (
                 "I could not find sufficiently relevant content in the selected documents. "
@@ -217,8 +400,21 @@ class RagService:
     def indexed_documents(self) -> list[dict[str, object]]:
         return self.store.indexed_documents()
 
+    def document_statuses(self) -> list[dict[str, object]]:
+        entries = self.manifest.load()
+        if not entries:
+            return self.store.indexed_documents()
+        return sorted(
+            entries.values(), key=lambda item: str(item.get("document_name", "")).lower()
+        )
+
     def delete_document(self, source_path: str) -> None:
         self.store.delete_document(source_path)
+        entries = self.manifest.load()
+        entry = entries.get(source_path)
+        if entry:
+            entry.update(status="removed", error="Removed by user", updated_at=self.manifest.now())
+            self.manifest.save(entries)
 
     def stats(self) -> dict[str, int]:
         return self.store.stats()
