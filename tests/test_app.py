@@ -9,6 +9,7 @@ from streamlit.testing.v1 import AppTest
 
 from document_analyst.app import _citation_links, _highlight_text
 from document_analyst.services.conversation_store import ConversationStore
+from document_analyst.ui.components import model_display_name
 from document_analyst.ui.theme import THEME_CSS
 
 
@@ -82,6 +83,99 @@ class RetrievalDiagnosticsUiTests(unittest.TestCase):
 
 
 class UiFoundationTests(unittest.TestCase):
+    def test_model_repository_has_a_readable_display_name(self) -> None:
+        self.assertEqual(
+            model_display_name("lmstudio-community/Qwen2.5-1.5B-Instruct-GGUF"),
+            "Qwen2.5 1.5B Instruct",
+        )
+
+    def test_advanced_model_settings_are_opt_in(self) -> None:
+        app = AppTest.from_string(
+            dedent(
+                """
+                from document_analyst.config import AppSettings
+                import document_analyst.app as application
+
+                application._cached_model_catalog = lambda: (
+                    ["sentence-transformers/all-MiniLM-L6-v2"],
+                    ["lmstudio-community/Qwen2.5-1.5B-Instruct-GGUF"],
+                )
+
+                class Models:
+                    def local_llm_model_path(self):
+                        return None
+                    def local_embedding_model_exists(self):
+                        return False
+
+                class Service:
+                    models = Models()
+
+                application._models_tab(AppSettings(), Service())
+                """
+            ),
+            default_timeout=15,
+        ).run()
+
+        self.assertFalse(app.exception)
+        markup = "\n".join(item.value for item in app.markdown)
+        self.assertIn("Model library", markup)
+        self.assertIn("Not installed", markup)
+        self.assertEqual(len(app.slider), 0)
+
+        advanced = next(toggle for toggle in app.toggle if toggle.label == "Enable advanced settings")
+        advanced.set_value(True).run()
+
+        self.assertFalse(app.exception)
+        self.assertGreaterEqual(len(app.slider), 6)
+        self.assertEqual([tab.label for tab in app.tabs], ["Retrieval", "Indexing", "OCR"])
+
+    def test_model_cards_refresh_after_download(self) -> None:
+        app = AppTest.from_string(
+            dedent(
+                """
+                from pathlib import Path
+                import streamlit as st
+                from document_analyst.config import AppSettings
+                import document_analyst.app as application
+
+                application._cached_model_catalog = lambda: (
+                    ["sentence-transformers/all-MiniLM-L6-v2"],
+                    ["lmstudio-community/Qwen2.5-1.5B-Instruct-GGUF"],
+                )
+
+                class Models:
+                    def local_llm_model_path(self):
+                        return Path("/models/model.gguf") if st.session_state.get("installed") else None
+                    def local_embedding_model_exists(self):
+                        return bool(st.session_state.get("installed"))
+
+                class Service:
+                    models = Models()
+
+                def download(service, update):
+                    st.session_state.installed = True
+                    return "/models/embeddings", "/models/model.gguf"
+
+                application._download_models_with_updates = download
+                application._models_tab(AppSettings(), Service())
+                """
+            ),
+            default_timeout=15,
+        ).run()
+
+        self.assertFalse(app.exception)
+        download = next(
+            button for button in app.button if button.label == "Download missing models"
+        )
+        download.click().run()
+
+        self.assertFalse(app.exception)
+        markup = "\n".join(item.value for item in app.markdown)
+        self.assertEqual(markup.count("Installed"), 2)
+        self.assertTrue(
+            any(button.label == "Verify model installation" for button in app.button)
+        )
+
     def test_theme_defines_shared_tokens_and_responsive_layout(self) -> None:
         self.assertIn("--da-accent", THEME_CSS)
         self.assertIn("--da-radius", THEME_CSS)

@@ -29,7 +29,10 @@ from document_analyst.services.model_manager import discover_model_repositories
 from document_analyst.ui.components import (
     app_header,
     empty_state,
+    model_display_name,
+    model_status_card,
     page_heading,
+    section_intro,
     sidebar_brand,
     sidebar_stats,
 )
@@ -512,8 +515,12 @@ def _index_job_panel(service: RagService) -> None:
 
 def _models_tab(settings: AppSettings, service: RagService) -> None:
     page_heading("Settings")
-    st.subheader("Model Downloads")
+    download_notice = st.session_state.pop("model_download_notice", None)
+    if download_notice:
+        st.toast(download_notice, icon=":material/check_circle:")
     local_llm = service.models.local_llm_model_path()
+    embedding_ready = service.models.local_embedding_model_exists()
+    llm_ready = local_llm is not None
     catalog_warning = ""
     try:
         live_embeddings, live_llms = _cached_model_catalog()
@@ -531,15 +538,74 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
     ):
         st.session_state.ocr_setup_shown = True
         _ocr_setup_dialog(settings.tesseract_cmd)
-    st.markdown(
-        f"""
-        - Embedding model directory: `{settings.embeddings_dir}`
-        - Embedding repo: `{settings.embeddings_repo}`
-        - LLM repo: `{settings.llm_repo}`
-        - Local GGUF: `{local_llm or 'Not downloaded yet'}`
-        """
+    section_intro(
+        "Model library",
+        "Select one model for document search and one model for answer generation.",
     )
-    if st.button("Download Selected Models", use_container_width=True):
+    status_left, status_right = st.columns(2, gap="medium")
+    with status_left:
+        model_status_card(
+            "Embedding model",
+            settings.embeddings_repo,
+            settings.embeddings_dir if embedding_ready else "Required to index and search documents",
+            embedding_ready,
+        )
+    with status_right:
+        model_status_card(
+            "Answer model",
+            settings.llm_repo,
+            str(local_llm) if local_llm else "Required to generate complete answers",
+            llm_ready,
+        )
+
+    if catalog_warning:
+        st.info("The online catalog is unavailable. Built-in model options are shown instead.")
+    else:
+        st.caption("Model options are refreshed from public Hugging Face repositories every hour.")
+
+    with st.form("model-selection-form"):
+        model_left, model_right = st.columns(2, gap="medium")
+        with model_left:
+            embeddings_repo = st.selectbox(
+                "Embedding model",
+                options=embedding_options,
+                index=embedding_options.index(settings.embeddings_repo),
+                format_func=model_display_name,
+                help="Creates vector representations used to locate relevant passages.",
+            )
+            st.caption(f"Repository: `{embeddings_repo}`")
+        with model_right:
+            llm_repo = st.selectbox(
+                "Answer model",
+                options=llm_options,
+                index=llm_options.index(settings.llm_repo),
+                format_func=model_display_name,
+                help="Generates cited answers from retrieved passages using llama.cpp.",
+            )
+            st.caption(f"Repository: `{llm_repo}`")
+        apply_selection = st.form_submit_button(
+            "Apply model selection",
+            type="primary",
+            use_container_width=True,
+        )
+    if apply_selection:
+        llm_changed = llm_repo.strip() != settings.llm_repo
+        settings.embeddings_repo = embeddings_repo.strip()
+        settings.llm_repo = llm_repo.strip()
+        if llm_changed:
+            settings.llm_filename = ""
+        save_settings(settings)
+        st.session_state.settings = settings
+        st.toast("Model selection updated.", icon=":material/check_circle:")
+        st.rerun()
+
+    models_ready = embedding_ready and llm_ready
+    if st.button(
+        "Verify model installation" if models_ready else "Download missing models",
+        type="secondary" if models_ready else "primary",
+        use_container_width=True,
+        help="Existing model files are reused. Only missing files are downloaded.",
+    ):
         overall_progress = st.progress(0, text="Preparing model downloads…")
         file_progress = st.progress(0, text="Waiting for the first file…")
 
@@ -569,76 +635,96 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
             return
         overall_progress.progress(1.0, text="Both models are ready")
         file_progress.progress(1.0, text="Download complete")
-        st.success(f"Models ready.\nEmbedding model: {embedding_dir}\nLLM: {llm_path}")
+        st.session_state.model_download_notice = (
+            f"Models ready. Embedding model: {embedding_dir}. Answer model: {llm_path}."
+        )
+        st.rerun()
 
-    st.write("")
-    st.subheader("Model Selection")
-    if catalog_warning:
-        st.info("Hugging Face is unavailable, so the built-in model catalog is being shown.")
-    else:
-        st.caption("This catalog is refreshed from public Hugging Face repositories every hour.")
-    with st.form("settings-form"):
-        embeddings_repo = st.selectbox(
-            "Embedding model",
-            options=embedding_options,
-            index=embedding_options.index(settings.embeddings_repo),
-            help="Choose which embedding model repo to download and use locally.",
+    st.divider()
+    section_intro(
+        "Advanced settings",
+        "Change retrieval, indexing, and OCR behavior only when the defaults are unsuitable.",
+    )
+    show_advanced = st.toggle(
+        "Enable advanced settings",
+        key="show_advanced_settings",
+        help="These controls affect retrieval quality, index construction, and processing time.",
+    )
+    if not show_advanced:
+        st.caption("Recommended defaults are active. Enable advanced settings to modify them.")
+        return
+
+    with st.form("advanced-settings-form"):
+        retrieval_tab, indexing_tab, ocr_tab = st.tabs(["Retrieval", "Indexing", "OCR"])
+        with retrieval_tab:
+            top_k = st.slider(
+                "Retrieved passages",
+                min_value=2,
+                max_value=8,
+                value=settings.top_k,
+                help="Maximum number of source passages supplied to the answer model.",
+            )
+            retrieval_min_score = st.slider(
+                "Minimum retrieval relevance",
+                min_value=-1.0,
+                max_value=1.0,
+                value=float(settings.retrieval_min_score),
+                step=0.05,
+                help="Strong exact-term BM25 matches may still qualify below this semantic score.",
+            )
+            max_history_turns = st.slider(
+                "Conversation turns in prompt",
+                min_value=2,
+                max_value=10,
+                value=settings.max_history_turns,
+            )
+        with indexing_tab:
+            st.caption(
+                "Changes affect newly indexed files. Rebuild the index to apply them "
+                "to existing documents."
+            )
+            semantic_threshold = st.slider(
+                "Semantic chunking threshold",
+                min_value=0.3,
+                max_value=0.8,
+                value=float(settings.semantic_threshold),
+                step=0.05,
+            )
+            llm_filename = st.text_input(
+                "Preferred GGUF filename",
+                value=settings.llm_filename,
+                help="Leave empty to select a compatible quantized file automatically.",
+            )
+        with ocr_tab:
+            enable_ocr = st.checkbox(
+                "Enable OCR fallback for scanned PDFs",
+                value=settings.enable_ocr,
+                help="Run Tesseract when a PDF page contains insufficient extractable text.",
+            )
+            ocr_min_text_chars = st.slider(
+                "OCR trigger threshold",
+                min_value=20,
+                max_value=200,
+                value=int(settings.ocr_min_text_chars),
+                help="OCR pages with fewer extracted characters than this value.",
+            )
+            ocr_zoom = st.slider(
+                "OCR render scale",
+                min_value=1.0,
+                max_value=3.0,
+                value=float(settings.ocr_zoom),
+                step=0.25,
+            )
+            tesseract_cmd = st.text_input(
+                "Tesseract executable path",
+                value=settings.tesseract_cmd,
+                help="Leave empty when Tesseract is available on PATH.",
+            )
+        saved = st.form_submit_button(
+            "Save advanced settings", type="primary", use_container_width=True
         )
-        llm_repo = st.selectbox(
-            "LLM GGUF model",
-            options=llm_options,
-            index=llm_options.index(settings.llm_repo),
-            help="Choose which local instruction model repo to download and run with llama.cpp.",
-        )
-        llm_filename = st.text_input("Preferred GGUF filename", value=settings.llm_filename)
-        top_k = st.slider("Retrieved chunks", min_value=2, max_value=8, value=settings.top_k)
-        retrieval_min_score = st.slider(
-            "Minimum retrieval relevance",
-            min_value=-1.0,
-            max_value=1.0,
-            value=float(settings.retrieval_min_score),
-            step=0.05,
-            help="Minimum semantic similarity. Strong exact-term BM25 matches may still qualify.",
-        )
-        max_history_turns = st.slider("Turns kept in prompt", min_value=2, max_value=10, value=settings.max_history_turns)
-        semantic_threshold = st.slider(
-            "Semantic chunking threshold",
-            min_value=0.3,
-            max_value=0.8,
-            value=float(settings.semantic_threshold),
-            step=0.05,
-        )
-        enable_ocr = st.checkbox(
-            "Enable OCR fallback for scanned PDFs",
-            value=settings.enable_ocr,
-            help="If a PDF page has very little extractable text, render it and run Tesseract OCR.",
-        )
-        ocr_min_text_chars = st.slider(
-            "OCR trigger threshold (characters)",
-            min_value=20,
-            max_value=200,
-            value=int(settings.ocr_min_text_chars),
-            help="Run OCR on a PDF page when extracted text is shorter than this threshold.",
-        )
-        ocr_zoom = st.slider(
-            "OCR render scale",
-            min_value=1.0,
-            max_value=3.0,
-            value=float(settings.ocr_zoom),
-            step=0.25,
-            help="Higher render scales can improve OCR quality, but are slower.",
-        )
-        tesseract_cmd = st.text_input(
-            "Tesseract executable path (optional)",
-            value=settings.tesseract_cmd,
-            help="Set this only if Tesseract is installed outside your normal PATH.",
-        )
-        saved = st.form_submit_button("Save Settings", use_container_width=True)
     if saved:
-        repo_changed = embeddings_repo.strip() != settings.embeddings_repo or llm_repo.strip() != settings.llm_repo
-        settings.embeddings_repo = embeddings_repo.strip()
-        settings.llm_repo = llm_repo.strip()
-        settings.llm_filename = "" if repo_changed and not llm_filename.strip() else llm_filename.strip()
+        settings.llm_filename = llm_filename.strip()
         settings.top_k = int(top_k)
         settings.retrieval_min_score = float(retrieval_min_score)
         settings.max_history_turns = int(max_history_turns)
@@ -653,7 +739,7 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
             st.session_state.ocr_setup_shown = True
             _ocr_setup_dialog(settings.tesseract_cmd)
             return
-        st.success("Settings saved.")
+        st.toast("Advanced settings saved.", icon=":material/check_circle:")
         st.rerun()
 
 

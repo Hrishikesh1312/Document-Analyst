@@ -148,6 +148,40 @@ THEME_CSS = """
     padding: 1rem 1.1rem;
 }
 .source-card { margin-bottom: .65rem; }
+.da-model-card {
+    background: var(--da-surface);
+    border: 1px solid var(--da-border);
+    border-radius: var(--da-radius);
+    margin-bottom: .75rem;
+    min-height: 118px;
+    padding: 1rem 1.1rem;
+}
+.da-model-card-top {
+    align-items: center;
+    display: flex;
+    justify-content: space-between;
+    margin-bottom: .45rem;
+}
+.da-model-role { font-size: .78rem; font-weight: 700; letter-spacing: .03em; }
+.da-model-name { font-size: 1rem; font-weight: 650; margin-bottom: .3rem; }
+.da-model-detail { color: var(--da-muted); font-size: .78rem; overflow-wrap: anywhere; }
+.da-badge {
+    border: 1px solid var(--da-border-strong);
+    border-radius: 999px;
+    color: var(--da-muted);
+    font-size: .68rem;
+    font-weight: 700;
+    padding: .2rem .5rem;
+    text-transform: uppercase;
+}
+.da-badge.ready {
+    background: var(--da-accent-soft);
+    border-color: rgba(66,214,164,.3);
+    color: var(--da-accent);
+}
+.da-section-intro { margin: .25rem 0 1rem; }
+.da-section-intro h3 { font-size: 1.1rem; margin: 0; }
+.da-section-intro p { color: var(--da-muted); font-size: .86rem; margin: .3rem 0 0; }
 .da-empty-state {
     background: var(--da-surface);
     border: 1px dashed var(--da-border-strong);
@@ -208,4 +242,3 @@ div.stButton > button, div.stDownloadButton > button { border-radius: 9px; }
 
 def inject_theme() -> None:
     st.markdown(THEME_CSS, unsafe_allow_html=True)
-

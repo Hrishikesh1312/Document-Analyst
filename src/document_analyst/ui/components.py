@@ -84,3 +84,42 @@ def empty_state(title: str, description: str, icon: str = "◇") -> None:
         """,
         unsafe_allow_html=True,
     )
+
+
+def section_intro(title: str, description: str) -> None:
+    st.markdown(
+        f"""
+        <div class="da-section-intro">
+            <h3>{html.escape(title)}</h3>
+            <p>{html.escape(description)}</p>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def model_status_card(
+    role: str,
+    repository: str,
+    detail: str,
+    ready: bool,
+) -> None:
+    badge = "Installed" if ready else "Not installed"
+    badge_class = "ready" if ready else ""
+    st.markdown(
+        f"""
+        <div class="da-model-card">
+            <div class="da-model-card-top">
+                <span class="da-model-role">{html.escape(role)}</span>
+                <span class="da-badge {badge_class}">{badge}</span>
+            </div>
+            <div class="da-model-name">{html.escape(model_display_name(repository))}</div>
+            <div class="da-model-detail">{html.escape(detail)}</div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+
+def model_display_name(repository: str) -> str:
+    return repository.rsplit("/", 1)[-1].replace("-GGUF", "").replace("-", " ")
