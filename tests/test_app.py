@@ -83,6 +83,46 @@ class RetrievalDiagnosticsUiTests(unittest.TestCase):
 
 
 class UiFoundationTests(unittest.TestCase):
+    def test_navigation_switches_on_every_click_and_survives_reruns(self) -> None:
+        app = AppTest.from_string(
+            dedent(
+                """
+                import streamlit as st
+                from document_analyst.app import _sidebar
+                from document_analyst.config import AppSettings
+                from document_analyst.ui.state import initialize_session_state
+
+                class Service:
+                    def stats(self):
+                        return {"documents": 0, "chunks": 0}
+
+                initialize_session_state()
+                if st.button("Go to Settings"):
+                    st.session_state.active_view = "Settings"
+                st.write(_sidebar(AppSettings(), Service(), None))
+                """
+            ),
+            default_timeout=15,
+        ).run()
+
+        navigation_id = app.radio[0].id
+        for view in ["Library", "Settings", "Ask", "Settings", "Library"]:
+            app.radio[0].set_value(view).run()
+            self.assertFalse(app.exception)
+            self.assertEqual(app.radio[0].value, view)
+            self.assertEqual(app.session_state.active_view, view)
+            self.assertEqual(app.main.markdown[0].value, view)
+            app.run()
+            self.assertEqual(app.radio[0].id, navigation_id)
+            self.assertEqual(app.radio[0].value, view)
+            self.assertEqual(app.session_state.active_view, view)
+
+        app.button[0].click().run()
+        self.assertFalse(app.exception)
+        self.assertEqual(app.radio[0].value, "Settings")
+        app.radio[0].set_value("Ask").run()
+        self.assertEqual(app.session_state.active_view, "Ask")
+
     def test_model_repository_has_a_readable_display_name(self) -> None:
         self.assertEqual(
             model_display_name("lmstudio-community/Qwen2.5-1.5B-Instruct-GGUF"),

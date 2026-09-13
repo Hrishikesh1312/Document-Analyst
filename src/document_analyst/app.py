@@ -108,6 +108,10 @@ def run() -> None:
         _models_tab(settings, service)
 
 
+def _select_workspace_view() -> None:
+    st.session_state.active_view = st.session_state.workspace_navigation
+
+
 def _sidebar(
     settings: AppSettings, service: RagService, conversation_store: ConversationStore
 ) -> str:
@@ -119,14 +123,17 @@ def _sidebar(
             "Library": "▤  Library",
             "Settings": "⚙  Settings",
         }
+        # Keep programmatic navigation in sync without changing widget identity.
+        # User selections update active_view in the callback before the next run.
+        st.session_state.workspace_navigation = st.session_state.active_view
         active_view = st.radio(
             "Workspace navigation",
             views,
-            index=views.index(st.session_state.active_view),
+            key="workspace_navigation",
+            on_change=_select_workspace_view,
             format_func=lambda view: view_labels[view],
             label_visibility="collapsed",
         )
-        st.session_state.active_view = active_view
         stats = service.stats()
         sidebar_stats(stats["documents"], stats["chunks"])
         st.caption("Files and inference remain on this device.")
