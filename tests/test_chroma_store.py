@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from document_analyst.config import AppSettings
 from document_analyst.models import ChunkRecord
@@ -9,6 +10,29 @@ from document_analyst.services.chroma_store import ChromaStore
 
 
 class ChromaStoreTests(unittest.TestCase):
+    def test_metadata_and_corpus_reads_are_bounded_and_preserve_all_chunks(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ChromaStore(AppSettings(chroma_dir=directory))
+            chunks = [
+                ChunkRecord(f"a:{i}", "/docs/a.txt", "a.txt", f"alpha {i}", i, 8, 1)
+                for i in range(23)
+            ]
+            with patch.object(ChromaStore, "READ_BATCH_SIZE", 7):
+                store.upsert_chunks(chunks, [[1.0, 0.0]] * len(chunks))
+                original_get = store.collection.get
+
+                def bounded_get(**kwargs):
+                    self.assertLessEqual(kwargs["limit"], 7)
+                    return original_get(**kwargs)
+
+                with patch.object(store.collection, "get", side_effect=bounded_get):
+                    self.assertEqual(store.stats(), {"documents": 1, "chunks": 23})
+                    self.assertEqual(len(store._corpus()), 23)
+                    self.assertEqual(len({item.chunk_id for item in store._corpus()}), 23)
+                    store.upsert_chunks(chunks[:2], [[1.0, 0.0]] * 2)
+                    self.assertEqual(store.stats(), {"documents": 1, "chunks": 2})
+                    self.assertEqual(len(store._corpus()), 2)
+
     def test_query_filters_documents_thresholds_scores_and_renumbers_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ChromaStore(AppSettings(chroma_dir=directory))

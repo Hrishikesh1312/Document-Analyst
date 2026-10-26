@@ -42,6 +42,9 @@ class _RankedChunk:
 
 
 class ChromaStore:
+    # Reads also bind IDs internally when Chroma fetches metadata. Keep pages
+    # below SQLite's conservative 999-variable limit, independently of writes.
+    READ_BATCH_SIZE = 500
     LEXICAL_STOP_WORDS = {
         "a", "an", "and", "are", "as", "at", "be", "by", "for", "from", "how",
         "in", "is", "it", "of", "on", "or", "that", "the", "this", "to", "was",
@@ -101,10 +104,14 @@ class ChromaStore:
         for chunk in chunks:
             ids_by_source.setdefault(chunk.source_path, set()).add(chunk.chunk_id)
         for source_path, current_ids in ids_by_source.items():
-            existing = self.collection.get(where={"source_path": source_path}, include=[])
-            stale_ids = [item for item in existing.get("ids", []) if item not in current_ids]
-            if stale_ids:
-                self.collection.delete(ids=stale_ids)
+            stale_ids = [
+                item
+                for page in self._get_pages(include=[], where={"source_path": source_path})
+                for item in page.get("ids", [])
+                if item not in current_ids
+            ]
+            for start, stop in self._batches(len(stale_ids), self.READ_BATCH_SIZE):
+                self.collection.delete(ids=stale_ids[start:stop])
         self._corpus_cache = None
 
     def hybrid_query(
@@ -286,9 +293,9 @@ class ChromaStore:
 
     def _corpus(self) -> list[_CorpusChunk]:
         if self._corpus_cache is None:
-            payload = self.collection.get(include=["documents", "metadatas"])
             self._corpus_cache = [
                 _CorpusChunk(str(chunk_id), str(text), dict(meta), self._tokenize(str(text)))
+                for payload in self._get_pages(include=["documents", "metadatas"])
                 for chunk_id, text, meta in zip(
                     payload.get("ids", []),
                     payload.get("documents", []),
@@ -393,9 +400,14 @@ class ChromaStore:
         )
 
     def indexed_documents(self) -> list[dict[str, object]]:
-        payload = self.collection.get(include=["metadatas"])
+        metadatas = (
+            meta
+            for payload in self._get_pages(include=["metadatas"])
+            for meta in payload.get("metadatas", [])
+            if meta is not None
+        )
         documents: dict[str, dict[str, object]] = {}
-        for meta in payload.get("metadatas", []):
+        for meta in metadatas:
             source_path = str(meta["source_path"])
             item = documents.setdefault(
                 source_path,
@@ -409,6 +421,18 @@ class ChromaStore:
             )
             item["chunks"] = int(item["chunks"]) + 1
         return sorted(documents.values(), key=lambda item: str(item["document_name"]).lower())
+
+    def _get_pages(self, *, include: list[str], where: dict | None = None) -> Iterator[dict]:
+        offset = 0
+        while True:
+            payload = self.collection.get(
+                include=include, where=where, limit=self.READ_BATCH_SIZE, offset=offset,
+            )
+            yield payload
+            count = len(payload.get("ids", []))
+            if count < self.READ_BATCH_SIZE:
+                break
+            offset += count
 
     @staticmethod
     def _batches(length: int, size: int) -> Iterator[tuple[int, int]]:

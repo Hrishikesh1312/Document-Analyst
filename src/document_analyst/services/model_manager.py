@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+import json
 import re
 import shutil
 import warnings
@@ -116,6 +117,11 @@ class ModelManager:
             max_workers=1 if progress else 8,
             tqdm_class=_progress_tqdm(progress, "embeddings") if progress else None,
         )
+        if not self._embedding_download_complete(target):
+            raise FileNotFoundError(
+                f"Embedding model download is incomplete in {target}: missing config or model weights. "
+                "Retry Download missing models in Settings."
+            )
         if progress:
             progress("embeddings", "Embedding model ready", 1, 1)
         return target
@@ -169,8 +175,10 @@ class ModelManager:
         from sentence_transformers import SentenceTransformer
 
         model_dir = self.ensure_embedding_model() if download_if_missing else Path(self.settings.embeddings_dir)
-        if not model_dir.exists():
-            raise FileNotFoundError("Embedding model not found locally.")
+        if not self._embedding_download_complete(model_dir):
+            raise FileNotFoundError(
+                "Embedding model is missing or incomplete. Download missing models in Settings."
+            )
         return SentenceTransformer(str(model_dir), device="cpu", local_files_only=True)
 
     def delete_downloaded_models(self) -> None:
@@ -204,6 +212,22 @@ class ModelManager:
 
     @staticmethod
     def _embedding_download_complete(directory: Path) -> bool:
-        if not directory.is_dir():
+        def populated_file(path: Path) -> bool:
+            return path.is_file() and path.stat().st_size > 0
+
+        if not populated_file(directory / "config.json"):
             return False
-        return any(item.name != ".cache" for item in directory.iterdir())
+        if any(populated_file(directory / name) for name in ("model.safetensors", "pytorch_model.bin")):
+            return True
+        for name in ("model.safetensors.index.json", "pytorch_model.bin.index.json"):
+            try:
+                index = json.loads((directory / name).read_text())
+                shards = index["weight_map"].values()
+                if shards and all(
+                    populated_file(ModelManager._safe_model_path(directory, shard))
+                    for shard in shards
+                ):
+                    return True
+            except (OSError, ValueError, KeyError, TypeError, AttributeError):
+                continue
+        return False

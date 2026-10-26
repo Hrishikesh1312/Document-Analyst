@@ -223,6 +223,29 @@ mark { background: rgba(246,185,74,.25); color: var(--da-text); padding: 0 .12em
 code { color: var(--da-accent); }
 
 div.stButton > button, div.stDownloadButton > button { border-radius: 9px; }
+button[kind="primary"] {
+    background: #294b3e;
+    border-color: #426b58;
+    color: var(--da-text);
+}
+button[kind="primary"]:hover:not(:disabled) {
+    background: #335b4b;
+    border-color: #608f78;
+    color: var(--da-text);
+}
+button[kind="primary"]:active:not(:disabled) {
+    background: #234034;
+}
+button[kind="primary"]:focus-visible {
+    outline: 2px solid #86b39b;
+    outline-offset: 3px;
+    box-shadow: none;
+}
+button[kind="primary"]:disabled {
+    background: #202f29;
+    border-color: #34483e;
+    color: var(--da-muted);
+}
 [data-testid="stMetric"] {
     background: var(--da-surface);
     border: 1px solid var(--da-border);
