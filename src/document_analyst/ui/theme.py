@@ -14,8 +14,8 @@ THEME_CSS = """
     --da-border-strong: #354455;
     --da-text: #f2f5f7;
     --da-muted: #94a3b3;
-    --da-accent: #42d6a4;
-    --da-accent-soft: rgba(66, 214, 164, 0.12);
+    --da-accent: #4f806c;
+    --da-accent-soft: rgba(79, 128, 108, 0.12);
     --da-warning: #f6b94a;
     --da-error: #f36c75;
     --da-radius: 12px;
@@ -87,7 +87,7 @@ THEME_CSS = """
 }
 [data-testid="stSidebar"] [role="radiogroup"] > label:has(input:checked) {
     background: var(--da-accent-soft);
-    border-color: rgba(66,214,164,.3);
+    border-color: rgba(79,128,108,.3);
 }
 [data-testid="stSidebar"] [role="radiogroup"] p {
     color: var(--da-text);
@@ -176,7 +176,7 @@ THEME_CSS = """
 }
 .da-badge.ready {
     background: var(--da-accent-soft);
-    border-color: rgba(66,214,164,.3);
+    border-color: rgba(79,128,108,.3);
     color: var(--da-accent);
 }
 .da-section-intro { margin: .25rem 0 1rem; }
