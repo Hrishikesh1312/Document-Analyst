@@ -9,7 +9,7 @@ import re
 import shutil
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
 
 import streamlit as st
@@ -25,9 +25,11 @@ from document_analyst.models import SourceRecord
 from document_analyst.services.conversation_export import conversation_markdown, conversation_pdf
 from document_analyst.services.conversation_store import ConversationStore
 from document_analyst.services.rag import RagService
+from document_analyst.services.index_progress import IndexProgressEvent, IndexProgressTracker
+from document_analyst.services.indexing_performance import apply_indexing_preset, benchmark_embedding_batches
+from document_analyst.services.library_search import filter_library_documents
 from document_analyst.services.model_manager import discover_model_repositories
 from document_analyst.ui.components import (
-    app_header,
     empty_state,
     model_display_name,
     model_status_card,
@@ -39,7 +41,7 @@ from document_analyst.ui.components import (
 from document_analyst.ui.state import initialize_session_state
 from document_analyst.ui.theme import inject_theme
 
-SERVICE_CACHE_VERSION = "document-lifecycle-v3"
+SERVICE_CACHE_VERSION = "automatic-embedding-device-v4"
 
 
 @dataclass
@@ -52,7 +54,10 @@ class _IndexJob:
     result: object | None = None
     error: Exception | None = None
     thread: threading.Thread | None = None
-    last_progress: tuple[str, str, int, int, bool] | None = None
+    progress: IndexProgressTracker = field(default_factory=IndexProgressTracker)
+    started_at: float = field(default_factory=time.monotonic)
+    finished_at: float | None = None
+    completion_refreshed: bool = False
 
 
 def run() -> None:
@@ -86,26 +91,23 @@ def run() -> None:
         st.session_state.show_empty_state_dialog = False
 
     active_view = _sidebar(settings, service, conversation_store)
-    app_header(
-        active_view,
-        stats["documents"],
-        stats["chunks"],
-        bool(service.models.local_llm_model_path()),
-    )
+
 
     if (
         stats["documents"] == 0
         and stats["chunks"] == 0
         and st.session_state.show_empty_state_dialog
     ):
-        _empty_state_dialog()
+        _empty_state_dialog(settings, service)
 
     if active_view == "Ask":
         _chat_tab(service, conversation_store)
     elif active_view == "Library":
         _docs_tab(settings, service)
-    else:
+    elif active_view == "Settings":
         _models_tab(settings, service)
+    elif active_view == "Help":
+        _help_tab()
 
 
 def _select_workspace_view() -> None:
@@ -117,11 +119,12 @@ def _sidebar(
 ) -> str:
     with st.sidebar:
         sidebar_brand()
-        views = ["Ask", "Library", "Settings"]
+        views = ["Ask", "Library", "Settings", "Help"]
         view_labels = {
             "Ask": "⌕  Ask",
             "Library": "▤  Library",
             "Settings": "⚙  Settings",
+            "Help": "?  Help",
         }
         # Keep programmatic navigation in sync without changing widget identity.
         # User selections update active_view in the callback before the next run.
@@ -136,7 +139,6 @@ def _sidebar(
         )
         stats = service.stats()
         sidebar_stats(stats["documents"], stats["chunks"])
-        st.caption("Files and inference remain on this device.")
         with st.container(key="sidebar_reset"):
             if st.button(
                 "Reset",
@@ -194,33 +196,64 @@ def _reset_dialog(service: RagService, conversation_store: ConversationStore) ->
             st.rerun()
 
 
-@st.dialog("No Documents Yet", width="large")
-def _empty_state_dialog() -> None:
-    st.markdown(
-        """
-        Your local index is empty right now.
-
-        To get started:
-        1. Open `Settings` and configure or download your embedding / GGUF models.
-        2. Open `Library` and add the local document folder you want to index.
-        3. Build the index, then come back to `Ask` to start asking questions.
-        """
-    )
-    col1, col2, col3 = st.columns(3)
-    with col1:
-        if st.button("Open Settings", use_container_width=True):
+@st.dialog("Welcome to Document Analyst", width="large")
+def _empty_state_dialog(settings: AppSettings, service: RagService) -> None:
+    st.markdown("Set up your local assistant, then add documents to start asking questions.")
+    if settings.chunking_mode == "semantic":
+        st.info(
+            "Semantic chunking is currently enabled. It groups passages by topic and can take "
+            "longer for large documents or many files. For faster indexing, open **Settings**, "
+            "enable **Advanced settings**, then choose **Indexing → Chunking method → "
+            "Fast — sentence boundaries** and save."
+        )
+    else:
+        st.caption("Fast chunking is enabled for quicker document indexing.")
+    ready = service.models.local_embedding_model_exists() and bool(service.models.local_llm_model_path())
+    if not ready:
+        st.markdown(
+            "**Get started with recommended settings**\n\n"
+            "We’ll download two models: one to search your documents and one to write answers. "
+            "This one-time setup needs internet and may take a few minutes. "
+            "Your documents and answers stay on your computer."
+        )
+        defaults = AppSettings()
+        st.caption(
+            f"Search: {model_display_name(defaults.embeddings_repo)} · "
+            f"Answers: {model_display_name(defaults.llm_repo)}"
+        )
+        if st.button("Proceed with recommended settings", type="primary", use_container_width=True):
+            recommended = replace(settings, embeddings_repo=defaults.embeddings_repo,
+                                  llm_repo=defaults.llm_repo, llm_filename="")
+            try:
+                save_settings(recommended)
+                st.session_state.settings = recommended
+                recommended_service = _cached_service(
+                    json.dumps(asdict(recommended), sort_keys=True), SERVICE_CACHE_VERSION
+                )
+            except Exception as exc:
+                st.error(f"Could not prepare setup: {exc}")
+                return
+            if not _download_models_in_ui(recommended_service):
+                st.info("Click Proceed again to retry. Downloaded files will be reused.")
+                return
+            st.rerun()
+        if st.button("Customize settings", use_container_width=True):
             st.session_state.active_view = "Settings"
             st.session_state.show_empty_state_dialog = False
             st.rerun()
-    with col2:
-        if st.button("Open Library", use_container_width=True):
+    else:
+        st.success("Your models are ready. Next, add your documents.")
+        st.markdown(
+            "Choose a folder in **Library**, then click **Build index**. "
+            "Once indexing finishes, open **Ask** to chat with your documents."
+        )
+        if st.button("Add documents", type="primary", use_container_width=True):
             st.session_state.active_view = "Library"
             st.session_state.show_empty_state_dialog = False
             st.rerun()
-    with col3:
-        if st.button("Dismiss", use_container_width=True):
-            st.session_state.show_empty_state_dialog = False
-            st.rerun()
+    if st.button("Set up later"):
+        st.session_state.show_empty_state_dialog = False
+        st.rerun()
 
 
 def _chat_tab(service: RagService, conversation_store: ConversationStore) -> None:
@@ -326,20 +359,77 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
             key="chat_document_filter",
             help="Leave empty to search the entire index.",
         )
-        st.caption(
-            f"Semantic floor {service.settings.retrieval_min_score:.2f}; strong BM25 matches can still qualify."
-        )
-        st.markdown("#### How answers are built")
+
+
+def _help_tab() -> None:
+    page_heading("Help")
+    with st.expander("Getting started", expanded=True):
         st.markdown(
-            """
-            1. Your question is embedded locally.
-            2. Semantic and BM25 searches build a shared candidate pool.
-            3. Candidates are reranked and diversified across documents.
-            4. The local GGUF model answers with inline citations like `[S1]`.
-            """
+            "1. In the welcome popup, choose **Proceed with recommended settings** to download "
+            "the search and answer models. You can also download or change models in **Settings**.\n"
+            "2. In **Library**, choose your documents folder and click **Build Index**.\n"
+            "3. Open **Ask** and ask a question about your indexed documents.\n\n"
+            "In **Library**, search by document name or folder path and filter by indexing status "
+            "or file type. Use **Clear filters** to see all documents. Results are paginated. "
+            "Click **View passages** on a document to inspect its extracted text and page references."
         )
-        st.markdown("#### Chat behavior")
-        st.caption("Only the latest conversation window is included in each prompt to keep CPU latency reasonable.")
+    with st.expander("Conversations and downloads"):
+        st.markdown(
+            "Use the **Conversations** selector in Ask to reopen a saved chat. "
+            "You can create, rename, or delete conversations there.\n\n"
+            "Under **Download conversation**, choose **Download Markdown (.md)** for an editable "
+            "text file or **Download PDF (.pdf)** for a document you can print or share. "
+            "Downloads include the conversation and its source references."
+        )
+    with st.expander("Answers, sources, and search controls"):
+        st.markdown(
+            "Your question is embedded locally. Semantic search and keyword search (BM25) find "
+            "candidate passages, which are reranked and selected across documents. The local "
+            "answer model uses these passages and cites them as **[S1]**, **[S2]**, and so on.\n\n"
+            "Open **Sources** below an answer to check its evidence. Use **Search retrieved evidence** "
+            "to find text within those passages. Pin or exclude a source to control the next response.\n\n"
+            "Under **Search scope**, select documents to limit your search; leave it empty to search "
+            "the full index. Enable **Show retrieval diagnostics** to inspect search scores and timings. "
+            "The relevance threshold is in Settings; strong keyword matches can still qualify below it.\n\n"
+            "Only the latest conversation window is sent to the answer model to limit processing time. "
+            "Change its length in advanced settings."
+        )
+    with st.expander("Indexing speed and troubleshooting"):
+        st.markdown(
+            "Embedding batches automatically use CUDA when available, otherwise Apple MPS, "
+            "and CPU when neither is available. Settings shows the selected device after first use. "
+            "This accelerates sentence chunking, document embeddings, and search-query embeddings.\n\n"
+            "Large documents can take time to process. Progress shows PDF pages and embedding batches; "
+            "the first embedding batch also loads the search model. Live elapsed time and device are shown "
+            "during indexing. After several batches, the panel shows throughput and an estimate for the "
+            "current stage only. Overall progress is approximate because stages and file sizes vary. "
+            "Cancellation takes effect at a safe checkpoint.\n\n"
+            "In **Library → Indexing performance**, choose **Fast**, **Balanced**, or **Quality** "
+            "and click **Apply performance settings**. Fast uses larger sentence-based passages; "
+            "Balanced uses smaller sentence-based passages; Quality uses semantic chunking. "
+            "Batch size controls how many passages the model processes together. "
+            "**Benchmark batch sizes** compares sample-text speed without changing your settings. "
+            "Choose the fastest measured size above to use it. Larger batches need more memory; "
+            "if indexing runs out of memory, reduce the batch size and retry failed files.\n\n"
+            "For faster chunking, open **Settings → Advanced settings → Indexing** and choose "
+            "**Fast — sentence boundaries**. It skips sentence embeddings during chunking; final chunks "
+            "still receive embeddings for semantic search. Semantic mode uses topic-aware boundaries.\n\n"
+            "Changes apply to newly indexed files. To apply them to existing files, select "
+            "**Replace existing index contents** in Library and rebuild. This replaces the entire "
+            "current index with the selected folder. Unchanged files are otherwise skipped.\n\n"
+            "If a file fails, check its status in Library and use **Retry failed files**. "
+            "Scanned PDFs may need OCR enabled in Settings and Tesseract installed. "
+            "Convert legacy PowerPoint (.ppt) files to .pptx before indexing."
+        )
+    with st.expander("Models and privacy"):
+        st.markdown(
+            "The search model finds relevant passages; the answer model writes responses. "
+            "Model downloads and the public model catalog need internet access. "
+            "Existing downloaded files are reused. Catalog options refresh hourly, with built-in "
+            "options available when the catalog cannot be reached.\n\n"
+            "Your documents, index, conversations, and inference stay on this device. "
+            "Use **Reset** in the sidebar to choose which local app data to delete."
+        )
 
 
 def _docs_tab(settings: AppSettings, service: RagService) -> None:
@@ -381,19 +471,7 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
             _index_job_panel(service)
 
     with col2:
-        st.subheader("Index Settings")
-        st.markdown(
-            f"""
-            - Max file size: `{settings.max_file_size_mb}MB`
-            - Chunk size: `{settings.chunk_size}` chars
-            - Overlap: `{settings.chunk_overlap}` chars
-            - Semantic threshold: `{settings.semantic_threshold}`
-            - Top-k retrieval: `{settings.top_k}`
-            - Minimum relevance: `{settings.retrieval_min_score:.2f}`
-            - Supported formats: `{", ".join(settings.supported_extensions)}`
-            - OCR fallback: `{"On" if settings.enable_ocr else "Off"}`
-            """
-        )
+        _indexing_performance_controls(settings, service, indexing)
 
     st.write("")
     st.subheader("Indexed Documents")
@@ -406,7 +484,36 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
         )
         return
 
-    for item in docs:
+    _library_documents_panel(service, docs, indexing)
+
+
+def _clear_library_filters() -> None:
+    st.session_state.library_query = ""
+    st.session_state.library_status_filter = []
+    st.session_state.library_type_filter = []
+
+
+def _library_documents_panel(service: RagService, documents: list[dict], indexing: bool = False) -> None:
+    query = st.text_input("Search library", key="library_query", placeholder="Document name or folder path")
+    status_options = sorted({str(item.get("status", "indexed")) for item in documents})
+    type_options = sorted({Path(str(item["document_name"])).suffix.lower() for item in documents} - {""})
+    for key, options in (("library_status_filter", status_options), ("library_type_filter", type_options)):
+        if key in st.session_state and any(value not in options for value in st.session_state[key]):
+            st.session_state[key] = [value for value in st.session_state[key] if value in options]
+    status_column, type_column = st.columns(2)
+    statuses = status_column.multiselect("Indexing status", status_options, key="library_status_filter")
+    file_types = type_column.multiselect("File type", type_options, key="library_type_filter")
+    docs = filter_library_documents(documents, query, statuses, file_types)
+    st.caption(f"Showing {len(docs)} of {len(documents)} documents")
+    st.button("Clear filters", on_click=_clear_library_filters)
+    if not docs:
+        empty_state("No matching documents", "Try another name or clear the filters.")
+        return
+    page_size = 10
+    pages = (len(docs) + page_size - 1) // page_size
+    filter_id = hashlib.sha256(repr((query, statuses, file_types, len(docs))).encode()).hexdigest()[:12]
+    page = int(st.number_input("Library page", 1, pages, 1, key=f"library-page-{filter_id}")) if pages > 1 else 1
+    for item in docs[(page - 1) * page_size:page * page_size]:
         document_name = html.escape(str(item["document_name"]))
         source_path = html.escape(str(item["source_path"]))
         with st.container():
@@ -425,12 +532,97 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
                 st.caption(f"Status detail: {item['error']}")
             if item.get("duplicate_of"):
                 st.caption(f"Duplicate of: {item['duplicate_of']}")
+            if item.get("status") != "removed" and int(item.get("chunks", 0)) > 0:
+                if st.button("View passages", key=f"view-{item['source_path']}"):
+                    st.session_state.library_preview_path = str(item["source_path"])
             if item.get("status") != "removed" and st.button(
-                f"Remove from index: {item['document_name']}", key=f"del-{item['source_path']}"
+                f"Remove from index: {item['document_name']}", key=f"del-{item['source_path']}", disabled=indexing
             ):
                 service.delete_document(str(item["source_path"]))
                 st.success(f"Removed {item['document_name']} from the index.")
                 st.rerun()
+
+    selected_path = st.session_state.get("library_preview_path")
+    selected = next((item for item in docs if item["source_path"] == selected_path
+                     and item.get("status") != "removed" and int(item.get("chunks", 0)) > 0), None)
+    if selected:
+        _document_passages_panel(service, selected)
+
+
+def _document_passages_panel(service: RagService, document: dict) -> None:
+    st.subheader(f"Extracted passages: {document['document_name']}")
+    count = int(document.get("chunks", 0))
+    pages = max(1, (count + 9) // 10)
+    identifier = hashlib.sha256(repr((document["source_path"], document.get("file_hash"), count)).encode()).hexdigest()[:12]
+    page = int(st.number_input("Passage page", 1, pages, 1, key=f"passages-{identifier}")) if pages > 1 else 1
+    offset = (page - 1) * 10
+    try:
+        chunks = service.document_chunks(str(document["source_path"]), offset=offset, limit=10)
+    except Exception as exc:
+        st.error(f"Could not load passages: {exc}")
+        return
+    if not chunks:
+        st.info("No stored passages on this page. The index may have changed; refresh the library.")
+        return
+    st.caption(f"Passages {offset + 1}–{offset + len(chunks)} of {count}")
+    for chunk in chunks:
+        st.markdown(f"**Passage {int(chunk['sequence']) + 1} · Page {chunk.get('approx_page', 1)}**")
+        st.text(str(chunk["text"]))
+
+
+def _indexing_performance_controls(settings: AppSettings, service: RagService, indexing: bool) -> None:
+    st.subheader("Indexing performance")
+    st.caption(
+        f"Current: {settings.chunking_mode.title()} chunking · {settings.chunk_size} characters · "
+        f"batch size {settings.embedding_batch_size}"
+    )
+    with st.form("indexing-performance"):
+        preset = st.selectbox("Indexing preset", ["Keep current", "Fast", "Balanced", "Quality"],
+                              disabled=indexing)
+        st.caption("Fast: larger sentence-based passages. Balanced: smaller sentence-based passages. "
+                   "Quality: topic-aware semantic chunking.")
+        batch_size = st.number_input(
+            "Embedding batch size", min_value=1, max_value=256,
+            value=settings.embedding_batch_size, disabled=indexing,
+            help="Larger batches may improve throughput but use more memory. Reduce this if your GPU runs out of memory.",
+        )
+        if st.form_submit_button("Apply performance settings", disabled=indexing, use_container_width=True):
+            updated = apply_indexing_preset(settings, preset, int(batch_size))
+            save_settings(updated)
+            st.session_state.settings = updated
+            st.toast("Performance settings saved. Rebuild existing documents to apply chunking changes.")
+            st.rerun(scope="app")
+
+    embedding_ready = service.models.local_embedding_model_exists() if hasattr(service, "models") else False
+    if st.button("Benchmark batch sizes", disabled=indexing or not embedding_ready, use_container_width=True,
+                 help="Compare local embedding speed on sample text. No documents or settings are changed."):
+        progress = st.progress(0, text="Loading search model and warming up…")
+        try:
+            def update(current: int, total: int, size: int) -> None:
+                progress.progress((current - 1) / total, text=f"Testing batch size {size} ({current}/{total})")
+            results = benchmark_embedding_batches(service.ensure_embedder(), update)
+        except Exception as exc:
+            st.error(f"Benchmark failed: {exc}")
+        else:
+            progress.progress(1.0, text="Benchmark complete")
+            st.session_state.batch_benchmark = {
+                "repo": settings.embeddings_repo,
+                "device": service.models.embedding_device,
+                "results": results,
+            }
+    benchmark = st.session_state.get("batch_benchmark")
+    if benchmark and benchmark["repo"] == settings.embeddings_repo:
+        st.caption(f"Sample-text benchmark · {str(benchmark['device']).upper()} · real documents may differ")
+        st.dataframe([
+            {"Batch size": r.batch_size,
+             "Passages / second": round(r.passages_per_second, 1) if r.passages_per_second is not None else None,
+             "Result": r.error or "Completed"}
+            for r in benchmark["results"]
+        ], hide_index=True, use_container_width=True)
+        successful = [r for r in benchmark["results"] if r.passages_per_second is not None]
+        if successful:
+            best = max(successful, key=lambda r: r.passages_per_second)
+            st.caption(f"Fastest measured batch size: {best.batch_size}. Set it above to use it.")
 
 
 def _start_index_job(
@@ -444,20 +636,22 @@ def _start_index_job(
         raise RuntimeError("An indexing job is already running.")
     job = _IndexJob(directory, replace_existing, retry_failed_only)
 
-    def progress(phase: str, item: str, current: int, total: int, complete: bool) -> None:
-        job.events.put((phase, item, current, total, complete))
+    def progress(event: IndexProgressEvent) -> None:
+        job.events.put((event, time.monotonic()))
 
     def run_job() -> None:
         try:
             job.result = service.index_documents(
                 directory,
                 replace_existing=replace_existing,
-                progress=progress,
+                detail_progress=progress,
                 should_cancel=job.cancel_event.is_set,
                 retry_failed_only=retry_failed_only,
             )
         except Exception as exc:
             job.error = exc
+        finally:
+            job.finished_at = time.monotonic()
 
     job.thread = threading.Thread(target=run_job, name="document-index", daemon=True)
     st.session_state.index_job = job
@@ -471,31 +665,48 @@ def _index_job_panel(service: RagService) -> None:
         return
     while not job.events.empty():
         try:
-            job.last_progress = job.events.get_nowait()
+            job.progress.observe(*job.events.get_nowait())
         except queue.Empty:
             break
-    progress_value = 0.0
-    progress_text = "Preparing incremental index…"
-    if job.last_progress:
-        phase, item, current, total, complete = job.last_progress
-        ranges = {
-            "hashing": (0.0, 0.15),
-            "reading": (0.15, 0.30),
-            "chunking": (0.30, 0.50),
-            "embedding": (0.50, 0.85),
-            "writing": (0.85, 1.0),
-        }
-        start, end = ranges.get(phase, (0.0, 1.0))
-        completed = current if complete else max(0, current - 1)
-        progress_value = start + ((end - start) * (completed / total if total else 0.0))
-        progress_text = f"{phase.title()} {current}/{total}: {item}"
     alive = bool(job.thread and job.thread.is_alive())
-    st.progress(min(progress_value, 1.0), text=progress_text)
     if alive:
+        now = time.monotonic()
+        event = job.progress.latest
+        labels = {"hashing": "Checking files", "reading": "Reading document",
+                  "chunking": "Creating passages", "embedding": "Embedding passages",
+                  "writing": "Saving to library", "skipped": "File processed"}
+        title = labels.get(event.phase, event.phase.title()) if event else "Preparing index"
+        st.progress(job.progress.overall_fraction, text=title)
+        if event:
+            st.caption(f"File {event.document_index} of {event.documents_total} · {event.document_name}")
+            if event.total_units:
+                st.progress(event.stage_fraction,
+                            text=f"{event.completed_units:,} / {event.total_units:,} {event.unit}")
+            if event.detail:
+                st.caption(event.detail)
+        elapsed_column, device_column = st.columns(2)
+        elapsed_column.metric("Elapsed time", _format_elapsed_time(now - job.started_at))
+        device = getattr(getattr(service, "models", None), "embedding_device", None)
+        device_column.metric("Embedding device", {"cuda": "CUDA GPU", "mps": "Apple MPS", "cpu": "CPU"}.get(
+            device, "Not loaded"
+        ))
+        rate = job.progress.throughput(now)
+        remaining = job.progress.remaining_seconds(now)
+        if rate is not None:
+            st.caption(f"{rate:.1f} passages / second")
+        if remaining is not None:
+            st.caption(f"Estimated time left in this stage: {_format_elapsed_time(remaining)}")
+        elif event and event.unit == "passages" and event.completed_units < event.total_units:
+            st.caption("Estimating stage time after a few batches…")
         if st.button("Cancel indexing", type="secondary", use_container_width=True):
             job.cancel_event.set()
             st.warning("Cancellation requested. The current safe checkpoint will finish first.")
         return
+    if not job.completion_refreshed:
+        job.completion_refreshed = True
+        # The fragment refreshes independently while indexing. Refresh the whole
+        # app once so document cards, sidebar counts, and controls catch up too.
+        st.rerun(scope="app")
     if job.error:
         st.error(f"Indexing failed: {job.error}")
     elif job.result:
@@ -504,6 +715,8 @@ def _index_job_panel(service: RagService) -> None:
             st.warning("Indexing was cancelled. Completed files remain safely indexed.")
         else:
             st.success("Incremental indexing complete.")
+        if job.finished_at is not None:
+            st.metric("Total elapsed time", _format_elapsed_time(job.finished_at - job.started_at))
         st.markdown(
             f"Indexed `{result.document_count}` changed/new files into `{result.chunk_count}` chunks · "
             f"unchanged `{result.unchanged_count}` · duplicates `{result.duplicate_count}` · "
@@ -511,13 +724,20 @@ def _index_job_panel(service: RagService) -> None:
         )
         for warning in result.warnings:
             st.warning(warning)
-        retry, dismiss = st.columns(2)
-        if result.failed_count and retry.button("Retry failed files", use_container_width=True):
+        if result.failed_count and st.button("Retry failed files", use_container_width=True):
             _start_index_job(service, job.directory, retry_failed_only=True)
             st.rerun(scope="app")
-        if dismiss.button("Dismiss", use_container_width=True):
-            st.session_state.index_job = None
-            st.rerun(scope="app")
+
+
+def _format_elapsed_time(seconds: float) -> str:
+    seconds = max(0.0, seconds)
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    minutes, seconds = divmod(int(seconds), 60)
+    hours, minutes = divmod(minutes, 60)
+    if hours:
+        return f"{hours} h {minutes} min {seconds} s"
+    return f"{minutes} min {seconds} s"
 
 
 def _models_tab(settings: AppSettings, service: RagService) -> None:
@@ -565,10 +785,15 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
             llm_ready,
         )
 
+    device = getattr(service.models, "embedding_device", None)
+    device_labels = {"cuda": "NVIDIA GPU (CUDA)", "mps": "Apple GPU (MPS)", "cpu": "CPU"}
+    if device:
+        st.caption(f"Embedding device: {device_labels.get(device, device)}")
+    else:
+        st.caption("Embedding device: automatic (CUDA/MPS → CPU), selected on first use.")
+
     if catalog_warning:
         st.info("The online catalog is unavailable. Built-in model options are shown instead.")
-    else:
-        st.caption("Model options are refreshed from public Hugging Face repositories every hour.")
 
     with st.form("model-selection-form"):
         model_left, model_right = st.columns(2, gap="medium")
@@ -613,37 +838,10 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         use_container_width=True,
         help="Existing model files are reused. Only missing files are downloaded.",
     ):
-        overall_progress = st.progress(0, text="Preparing model downloads…")
-        file_progress = st.progress(0, text="Waiting for the first file…")
-
-        def update_download_progress(
-            phase: str, description: str, downloaded: int, total: int | None
-        ) -> None:
-            phase_number = 1 if phase == "embeddings" else 2
-            phase_name = "Embedding model" if phase == "embeddings" else "Language model"
-            file_fraction = min(downloaded / total, 1.0) if total and total > 0 else 0.0
-            overall_fraction = ((phase_number - 1) + file_fraction) / 2
-            overall_progress.progress(
-                overall_fraction,
-                text=f"Step {phase_number} of 2: {phase_name}",
-            )
-            size_text = _format_download_size(downloaded, total)
-            file_progress.progress(
-                file_fraction,
-                text=f"{description} · {size_text}",
-            )
-
-        try:
-            embedding_dir, llm_path = _download_models_with_updates(
-                service, update_download_progress
-            )
-        except Exception as exc:  # Hugging Face exposes several transport-specific errors.
-            st.error(f"Model download failed: {exc}")
+        if not _download_models_in_ui(service):
             return
-        overall_progress.progress(1.0, text="Both models are ready")
-        file_progress.progress(1.0, text="Download complete")
         st.session_state.model_download_notice = (
-            f"Models ready. Embedding model: {embedding_dir}. Answer model: {llm_path}."
+            "Models are ready to use."
         )
         st.rerun()
 
@@ -658,7 +856,6 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         help="These controls affect retrieval quality, index construction, and processing time.",
     )
     if not show_advanced:
-        st.caption("Recommended defaults are active. Enable advanced settings to modify them.")
         return
 
     with st.form("advanced-settings-form"):
@@ -686,9 +883,13 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
                 value=settings.max_history_turns,
             )
         with indexing_tab:
-            st.caption(
-                "Changes affect newly indexed files. Rebuild the index to apply them "
-                "to existing documents."
+            chunking_mode = st.selectbox(
+                "Chunking method",
+                options=["fast", "semantic"],
+                index=["fast", "semantic"].index(settings.chunking_mode),
+                format_func=lambda mode: "Fast — sentence boundaries" if mode == "fast" else "Semantic — topic-aware boundaries",
+                help="Fast skips sentence embeddings during chunking. Both methods use semantic search. "
+                     "Rebuild the index to apply this to documents already indexed.",
             )
             semantic_threshold = st.slider(
                 "Semantic chunking threshold",
@@ -735,6 +936,7 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         settings.top_k = int(top_k)
         settings.retrieval_min_score = float(retrieval_min_score)
         settings.max_history_turns = int(max_history_turns)
+        settings.chunking_mode = chunking_mode
         settings.semantic_threshold = float(semantic_threshold)
         settings.enable_ocr = bool(enable_ocr)
         settings.ocr_min_text_chars = int(ocr_min_text_chars)
@@ -973,16 +1175,17 @@ def _conversation_panel(store: ConversationStore) -> None:
     )
     safe_name = re.sub(r"[^A-Za-z0-9._-]+", "-", st.session_state.conversation_name).strip("-")
     safe_name = safe_name or "conversation"
+    st.markdown("#### Download conversation")
     export_markdown, export_pdf = st.columns(2)
     export_markdown.download_button(
-        "Markdown",
+        "Download Markdown (.md)",
         markdown,
         file_name=f"{safe_name}.md",
         mime="text/markdown",
         use_container_width=True,
     )
     export_pdf.download_button(
-        "PDF",
+        "Download PDF (.pdf)",
         conversation_pdf(
             st.session_state.conversation_name,
             st.session_state.messages,
@@ -1072,6 +1275,40 @@ def _repo_options(defaults: list[str], current_value: str) -> list[str]:
 @st.cache_data(ttl=3600, show_spinner=False)
 def _cached_model_catalog() -> tuple[list[str], list[str]]:
     return discover_model_repositories(limit=5)
+
+
+
+def _download_models_in_ui(service: RagService) -> bool:
+    overall_progress = st.progress(0, text="Preparing model downloads…")
+    file_progress = st.progress(0, text="Waiting for the first file…")
+
+    def update_download_progress(
+        phase: str, description: str, downloaded: int, total: int | None
+    ) -> None:
+        phase_number = 1 if phase == "embeddings" else 2
+        phase_name = "Embedding model" if phase == "embeddings" else "Language model"
+        file_fraction = min(downloaded / total, 1.0) if total and total > 0 else 0.0
+        overall_fraction = ((phase_number - 1) + file_fraction) / 2
+        overall_progress.progress(
+            overall_fraction,
+            text=f"Step {phase_number} of 2: {phase_name}",
+        )
+        size_text = _format_download_size(downloaded, total)
+        file_progress.progress(
+            file_fraction,
+            text=f"{description} · {size_text}",
+        )
+
+    try:
+        _download_models_with_updates(
+            service, update_download_progress
+        )
+    except Exception as exc:  # Hugging Face exposes several transport-specific errors.
+        st.error(f"Model download failed: {exc}")
+        return False
+    overall_progress.progress(1.0, text="Both models are ready")
+    file_progress.progress(1.0, text="Download complete")
+    return True
 
 
 def _format_download_size(downloaded: int, total: int | None) -> str:

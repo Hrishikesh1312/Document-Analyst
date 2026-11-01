@@ -16,8 +16,9 @@ from document_analyst.config import AppSettings
 from document_analyst.models import ChunkRecord, RetrievalDiagnostics, SourceRecord
 from document_analyst.services.chroma_store import ChromaStore
 from document_analyst.services.ingestion import DocumentIngestor
-from document_analyst.services.ingestion import IndexProgress
+from document_analyst.services.ingestion import IndexProgress, IndexingCancelled
 from document_analyst.services.index_manifest import IndexManifest
+from document_analyst.services.index_progress import IndexProgressEvent
 from document_analyst.services.model_manager import ModelManager
 from document_analyst.services.model_manager import DownloadProgress
 
@@ -99,7 +100,17 @@ class RagService:
         progress: IndexProgress | None = None,
         should_cancel: Callable[[], bool] | None = None,
         retry_failed_only: bool = False,
+        detail_progress: Callable[[IndexProgressEvent], None] | None = None,
     ) -> IndexResult:
+        def report(phase: str, item: str, current: int, total: int, complete: bool,
+                   *, done: int = 0, units: int = 0, unit: str = "", detail: str = "") -> None:
+            if progress:
+                progress(phase, item, current, total, complete)
+            if detail_progress:
+                detail_progress(IndexProgressEvent(
+                    phase, path.name, current, total, complete, done, units, unit, detail
+                ))
+
         if replace_existing:
             self.store.reset()
             self.manifest.reset()
@@ -128,8 +139,8 @@ class RagService:
             if should_cancel and should_cancel():
                 cancelled = True
                 break
-            if progress:
-                progress("hashing", path.name, index, total, False)
+            if progress or detail_progress:
+                report("hashing", path.name, index, total, False)
             try:
                 hashes[str(path.resolve())] = self._hash_file(path, should_cancel)
             except RuntimeError as exc:
@@ -137,8 +148,8 @@ class RagService:
                     raise
                 cancelled = True
                 break
-            if progress:
-                progress("hashing", path.name, index, total, True)
+            if progress or detail_progress:
+                report("hashing", path.name, index, total, True)
 
         canonical_by_hash: dict[str, str] = {}
         for path in paths:
@@ -162,6 +173,7 @@ class RagService:
             previous = entries.get(source_path, {})
             if retry_failed_only and previous.get("status") not in {"failed", "cancelled"}:
                 unchanged_count += 1
+                report("skipped", path.name, index, total, True, detail="Unchanged")
                 continue
             duplicate_of = canonical_by_hash.get(file_hash)
             if duplicate_of and duplicate_of != source_path:
@@ -171,6 +183,7 @@ class RagService:
                 )
                 duplicate_count += 1
                 self.manifest.save(entries)
+                report("skipped", path.name, index, total, True, detail="Duplicate")
                 continue
             if (
                 not replace_existing
@@ -179,28 +192,58 @@ class RagService:
             ):
                 unchanged_count += 1
                 canonical_by_hash.setdefault(file_hash, source_path)
+                report("skipped", path.name, index, total, True, detail="Unchanged")
                 continue
 
             try:
-                if progress:
-                    progress("reading", path.name, index, total, False)
-                document = self.ingestor.load_document(path)
+                if progress or detail_progress:
+                    report("reading", path.name, index, total, False)
+                def page_progress(done: int, pages: int, activity: str) -> None:
+                    if progress or detail_progress:
+                        report("reading", f"{path.name} · {activity} pages {done}/{pages}",
+                                 index, total, False, done=done, units=pages,
+                                 unit="pages", detail=activity)
+
+                document = self.ingestor.load_document(
+                    path, page_progress=page_progress, should_cancel=should_cancel
+                )
                 document.file_hash = file_hash
-                if progress:
-                    progress("reading", path.name, index, total, True)
+                if progress or detail_progress:
+                    report("reading", path.name, index, total, True)
                 if not document.text:
                     raise ValueError("no readable text found")
-                chunks = self.ingestor.build_chunks([document], self._embed_texts)
+                def embed_batches(texts: list[str], phase: str) -> list[list[float]]:
+                    vectors: list[list[float]] = []
+                    count = len(texts)
+                    for offset in range(0, count, self.settings.embedding_batch_size):
+                        if should_cancel and should_cancel():
+                            raise IndexingCancelled()
+                        end = min(offset + self.settings.embedding_batch_size, count)
+                        if progress or detail_progress:
+                            report(phase, f"{path.name} · passages {offset}/{count}",
+                                     index, total, False, done=offset, units=count, unit="passages",
+                                     detail="Loading search model and processing first batch" if self._embedder is None else "")
+                        vectors.extend(self._embed_texts(texts[offset:end]))
+                        if progress or detail_progress:
+                            report(phase, f"{path.name} · passages {end}/{count}",
+                                     index, total, False, done=end, units=count, unit="passages")
+                    return vectors
+
+                if progress or detail_progress:
+                    report("chunking", f"{path.name} · Preparing searchable passages", index, total, False)
+                chunks = self.ingestor.build_chunks(
+                    [document], lambda texts: embed_batches(texts, "chunking")
+                )
                 if not chunks:
                     raise ValueError("no searchable chunks were produced")
                 indexed_at = self.manifest.now()
                 for chunk in chunks:
                     chunk.indexed_at = indexed_at
-                if progress:
-                    progress("embedding", path.name, index, total, False)
-                embeddings = self._embed_texts([chunk.text for chunk in chunks])
-                if progress:
-                    progress("embedding", path.name, index, total, True)
+                if progress or detail_progress:
+                    report("embedding", path.name, index, total, False)
+                embeddings = embed_batches([chunk.text for chunk in chunks], "embedding")
+                if progress or detail_progress:
+                    report("embedding", path.name, index, total, True)
                 if should_cancel and should_cancel():
                     entries[source_path] = self._manifest_entry(
                         path, file_hash, "cancelled", error="Cancelled before database write"
@@ -208,17 +251,24 @@ class RagService:
                     cancelled = True
                     self.manifest.save(entries)
                     break
-                if progress:
-                    progress("writing", path.name, index, total, False)
+                if progress or detail_progress:
+                    report("writing", path.name, index, total, False)
                 self.store.upsert_chunks(chunks, embeddings)
-                if progress:
-                    progress("writing", path.name, index, total, True)
+                if progress or detail_progress:
+                    report("writing", path.name, index, total, True)
                 entries[source_path] = self._manifest_entry(
                     path, file_hash, "indexed", chunks=len(chunks), indexed_at=indexed_at
                 )
                 canonical_by_hash[file_hash] = source_path
                 indexed_count += 1
                 chunk_count += len(chunks)
+            except IndexingCancelled:
+                entries[source_path] = self._manifest_entry(
+                    path, file_hash, "cancelled", error="Cancelled during document processing"
+                )
+                cancelled = True
+                self.manifest.save(entries)
+                break
             except Exception as exc:  # Keep other files indexable and record a retryable failure.
                 if previous.get("status") == "indexed" and previous.get("file_hash") != file_hash:
                     self.store.delete_document(source_path)
@@ -227,6 +277,7 @@ class RagService:
                 )
                 warnings.append(f"Failed {path.name}: {exc}")
                 failed_count += 1
+                report("skipped", path.name, index, total, True, detail="Failed")
             self.manifest.save(entries)
 
         self.manifest.save(entries)
@@ -408,6 +459,9 @@ class RagService:
             entries.values(), key=lambda item: str(item.get("document_name", "")).lower()
         )
 
+    def document_chunks(self, source_path: str, offset: int = 0, limit: int = 10) -> list[dict]:
+        return self.store.document_chunks(source_path, offset, limit)
+
     def delete_document(self, source_path: str) -> None:
         self.store.delete_document(source_path)
         entries = self.manifest.load()
@@ -423,13 +477,14 @@ class RagService:
         """Release in-memory model handles before their files are removed."""
         self._embedder = None
         self._llm = None
+        self.models.embedding_device = None
         gc.collect()
 
     def _embed_texts(self, texts: list[str]) -> list[list[float]]:
         embedder = self.ensure_embedder()
         matrix = embedder.encode(
             texts,
-            batch_size=32,
+            batch_size=self.settings.embedding_batch_size,
             show_progress_bar=False,
             convert_to_numpy=True,
             normalize_embeddings=True,

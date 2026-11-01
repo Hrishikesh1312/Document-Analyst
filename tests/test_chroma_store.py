@@ -33,6 +33,28 @@ class ChromaStoreTests(unittest.TestCase):
                     self.assertEqual(store.stats(), {"documents": 1, "chunks": 2})
                     self.assertEqual(len(store._corpus()), 2)
 
+    def test_document_passages_are_scoped_ordered_and_bounded(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store = ChromaStore(AppSettings(chroma_dir=directory))
+            chunks = [ChunkRecord(f"a:{i}", "/docs/a.pdf", "a.pdf", f"Passage {i}", i, 10, i + 1)
+                      for i in reversed(range(23))]
+            store.upsert_chunks(chunks, [[1.0, 0.0]] * len(chunks))
+            store.upsert_chunks([ChunkRecord("b:0", "/other/a.pdf", "a.pdf", "Other document", 0, 14, 1)], [[0.0, 1.0]])
+            original_get = store.collection.get
+            with patch.object(store.collection, "get", wraps=original_get) as get:
+                page = store.document_chunks("/docs/a.pdf", offset=10, limit=5)
+            self.assertEqual([c["sequence"] for c in page], list(range(10, 15)))
+            self.assertEqual(page[0]["approx_page"], 11)
+            self.assertTrue(all(c["source_path"] == "/docs/a.pdf" for c in page))
+            self.assertEqual(get.call_args.kwargs["limit"], 5)
+            self.assertNotIn("embeddings", get.call_args.kwargs["include"])
+            self.assertEqual(len(store.document_chunks("/docs/a.pdf", offset=20)), 3)
+            self.assertEqual(store.document_chunks("/missing.pdf"), [])
+            self.assertEqual(store.document_chunks("/docs/a.pdf", offset=30), [])
+            for offset, limit in ((-1, 10), (0, 0), (0, 501)):
+                with self.assertRaises(ValueError):
+                    store.document_chunks("/docs/a.pdf", offset=offset, limit=limit)
+
     def test_query_filters_documents_thresholds_scores_and_renumbers_sources(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store = ChromaStore(AppSettings(chroma_dir=directory))

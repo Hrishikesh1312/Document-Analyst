@@ -422,6 +422,22 @@ class ChromaStore:
             item["chunks"] = int(item["chunks"]) + 1
         return sorted(documents.values(), key=lambda item: str(item["document_name"]).lower())
 
+    def document_chunks(self, source_path: str, offset: int = 0, limit: int = 10) -> list[dict]:
+        """Read one bounded page in source sequence order, without loading vectors."""
+        if offset < 0 or not 1 <= limit <= self.READ_BATCH_SIZE:
+            raise ValueError("Invalid chunk page bounds")
+        payload = self.collection.get(
+            where={"$and": [
+                {"source_path": source_path}, {"sequence": {"$gte": offset}},
+                {"sequence": {"$lt": offset + limit}},
+            ]},
+            include=["documents", "metadatas"], limit=limit,
+        )
+        chunks = [dict(meta, text=text) for meta, text in zip(
+            payload.get("metadatas") or [], payload.get("documents") or []
+        ) if meta is not None]
+        return sorted(chunks, key=lambda item: int(item["sequence"]))
+
     def _get_pages(self, *, include: list[str], where: dict | None = None) -> Iterator[dict]:
         offset = 0
         while True:

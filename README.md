@@ -182,3 +182,58 @@ python -m compileall -q src app.py
 ```
 
 Native dependencies such as PyTorch and `llama.cpp` may require platform-specific wheels. Use a platform-specific lock file for reproducible deployments.
+
+### Faster indexing
+
+In Settings, enable advanced settings and open Indexing. Choose **Fast — sentence boundaries**
+under **Chunking method**, then save. This uses sentence boundaries, chunk size, and overlap
+without running a model on each sentence to choose boundaries. Finished chunks still receive
+embeddings for semantic search. **Semantic — topic-aware boundaries** remains the default.
+Both modes embed passages in configurable batches (32 by default), with progress and cancellation between batches.
+The speedup depends on the document and hardware; final chunk embedding still takes time.
+To apply a changed method to previously indexed documents, rebuild using **Replace existing
+index contents** in Library (this replaces the entire current index with the selected folder).
+
+### Embedding GPU acceleration
+
+Embedding models select a device automatically on first use: **CUDA/MPS → CPU**.
+CUDA requires a CUDA-enabled PyTorch installation and a compatible GPU/driver. On supported
+Macs, PyTorch uses Apple's MPS backend. CPU is selected when neither backend is available
+to PyTorch. See [PyTorch installation instructions](https://pytorch.org/get-started/locally/)
+for the build appropriate to your machine.
+
+The selected device is shown in Settings after the model loads. The same cached model handles
+semantic chunking, final chunk embeddings, and search-query embeddings with the configured batch size.
+Embeddings are normalized and returned to host memory for storage and retrieval as before.
+Model loading remains lazy, so opening Settings does not initialize PyTorch.
+If an available GPU fails during loading or inference, the error is reported rather than
+silently switching to CPU. This change applies to sentence-transformer embeddings; GGUF
+answer generation still uses its existing llama.cpp configuration.
+
+### Progress, performance controls, and library search
+
+Indexing shows the current stage, file, page or passage counts, live elapsed time, and embedding
+device. The overall bar advances within each file; it is an approximate workload measure rather
+than a prediction of wall-clock time. After several embedding batches, the panel shows passages
+per second and an estimated time remaining for that stage. Completion refreshes the document
+list automatically and preserves total elapsed time.
+
+Library's **Indexing performance** controls offer these presets:
+
+| Preset | Chunking | Target chunk size | Overlap |
+| --- | --- | --- | --- |
+| Fast | Sentence boundaries | 1,000 characters | 100 characters |
+| Balanced | Sentence boundaries | 700 characters | 100 characters |
+| Quality | Semantic topic boundaries | 500 characters | 100 characters |
+
+Choose a preset and embedding batch size (1–256), then click **Apply performance settings**.
+Presets preserve model, retrieval, OCR, and document-folder settings. Existing documents need
+a rebuild to apply chunking changes; batch-size changes affect subsequent embedding calls.
+The optional **Benchmark batch sizes** compares 8, 16, 32, 64, and 128 on the same sample text,
+excluding model warmup. It reports results without changing settings or indexing documents.
+Results depend on text length and hardware. Reduce the batch size if device memory is exhausted.
+
+Search Library by document name or folder path, combine status and file-type filters, and clear
+filters to restore all results. Documents display ten per page. **View passages** retrieves ten
+stored chunks per page for the selected document, in source order with page references, without
+loading stored embeddings or rerunning the model.

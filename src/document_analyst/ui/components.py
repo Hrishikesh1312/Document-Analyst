@@ -9,6 +9,7 @@ VIEW_DETAILS = {
     "Ask": ("Ask", "Query your local knowledge base and verify every answer."),
     "Library": ("Document library", "Index, inspect, and maintain your local sources."),
     "Settings": ("Models & settings", "Configure local inference and retrieval behavior."),
+    "Help": ("Help", "Get started, understand answers, and find troubleshooting guidance."),
 }
 
 
@@ -33,26 +34,6 @@ def sidebar_stats(documents: int, chunks: int) -> None:
         <div class="da-sidebar-stats">
             <div class="da-sidebar-stat"><strong>{documents}</strong>Documents</div>
             <div class="da-sidebar-stat"><strong>{chunks}</strong>Chunks</div>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-
-def app_header(active_view: str, documents: int, chunks: int, model_ready: bool) -> None:
-    title, _ = VIEW_DETAILS.get(active_view, (active_view, ""))
-    readiness = "Local model ready" if model_ready else "Model setup required"
-    readiness_class = "ready" if model_ready else ""
-    st.markdown(
-        f"""
-        <div class="da-app-header">
-            <div>
-                <div class="da-app-title">{html.escape(title)}</div>
-                <div class="da-app-meta">{documents} documents · {chunks} searchable chunks</div>
-            </div>
-            <div class="da-status {readiness_class}">
-                <span class="da-status-dot"></span>{readiness}
-            </div>
         </div>
         """,
         unsafe_allow_html=True,

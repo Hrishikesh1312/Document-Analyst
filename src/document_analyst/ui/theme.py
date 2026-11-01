@@ -105,30 +105,6 @@ THEME_CSS = """
 .da-sidebar-stat { color: var(--da-muted); font-size: .72rem; }
 .da-sidebar-stat strong { color: var(--da-text); display: block; font-size: 1rem; }
 
-.da-app-header {
-    align-items: center;
-    border-bottom: 1px solid var(--da-border);
-    display: flex;
-    justify-content: space-between;
-    margin-bottom: 1.75rem;
-    padding: .1rem 0 1.1rem;
-}
-.da-app-title { font-size: 1.1rem; font-weight: 700; letter-spacing: -.02em; }
-.da-app-meta { color: var(--da-muted); font-size: .8rem; margin-top: .2rem; }
-.da-status {
-    align-items: center;
-    background: var(--da-surface);
-    border: 1px solid var(--da-border);
-    border-radius: 999px;
-    color: var(--da-muted);
-    display: inline-flex;
-    font-size: .75rem;
-    gap: .45rem;
-    padding: .38rem .7rem;
-}
-.da-status-dot { background: var(--da-muted); border-radius: 50%; height: 7px; width: 7px; }
-.da-status.ready .da-status-dot { background: var(--da-accent); box-shadow: 0 0 0 3px var(--da-accent-soft); }
-
 .da-page-heading { margin-bottom: 1.4rem; }
 .da-eyebrow {
     color: var(--da-accent);
@@ -256,7 +232,6 @@ button[kind="primary"]:disabled {
 
 @media (max-width: 900px) {
     .block-container { padding-left: 1rem; padding-right: 1rem; }
-    .da-app-header { align-items: flex-start; gap: .8rem; }
     .da-page-heading h1 { font-size: 1.65rem; }
 }
 </style>

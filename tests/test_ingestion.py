@@ -13,6 +13,56 @@ from document_analyst.services.ingestion import DocumentIngestor
 
 
 class IngestionTests(unittest.TestCase):
+    def test_fast_chunking_skips_sentence_embeddings_and_keeps_sources(self) -> None:
+        from unittest.mock import Mock
+
+        ingestor = DocumentIngestor(AppSettings(
+            chunking_mode="fast", chunk_size=100, chunk_overlap=20
+        ))
+        first = "First sentence contains important context for this document."
+        second = "Second sentence adds enough text to start the next chunk."
+        third = "Third sentence finishes the document with more context."
+        document = DocumentRecord(
+            source_path="/docs/book.pdf", name="book.pdf", extension=".pdf",
+            size_bytes=200, text=" ".join([first, second, third]),
+            page_spans=[PageSpan(1, first), PageSpan(2, f"{second} {third}")],
+            file_hash="source-hash",
+        )
+        embed = Mock(side_effect=AssertionError("Fast chunking must not embed sentences"))
+        chunks = ingestor.build_chunks([document], embed)
+        embed.assert_not_called()
+        self.assertGreater(len(chunks), 1)
+        for sentence in (first, second, third):
+            self.assertTrue(any(sentence in chunk.text for chunk in chunks))
+        self.assertEqual(chunks[0].approx_page, 1)
+        self.assertEqual(chunks[-1].approx_page, 2)
+        self.assertTrue(all(chunk.file_hash == "source-hash" for chunk in chunks))
+        self.assertTrue(all(chunk.source_path == "/docs/book.pdf" for chunk in chunks))
+        self.assertEqual(len({chunk.chunk_id for chunk in chunks}), len(chunks))
+
+    def test_pdf_page_progress_and_cancellation(self) -> None:
+        import pymupdf
+        from document_analyst.services.ingestion import IndexingCancelled
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "pages.pdf"
+            with pymupdf.open() as pdf:
+                for index in range(3):
+                    pdf.new_page().insert_text((72, 72), f"Page {index + 1}")
+                pdf.save(path)
+            events = []
+            ingestor = DocumentIngestor(AppSettings())
+            document = ingestor.load_document(path, page_progress=lambda *event: events.append(event))
+            self.assertEqual(len(document.page_spans), 3)
+            self.assertEqual(events[-1], (3, 3, "Read"))
+            events.clear()
+            with self.assertRaises(IndexingCancelled):
+                ingestor.load_document(
+                    path, page_progress=lambda *event: events.append(event),
+                    should_cancel=lambda: bool(events and events[-1][0] == 1),
+                )
+            self.assertEqual(events[-1], (1, 3, "Read"))
+
     def test_discovery_is_case_insensitive_and_skips_symlinks(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -16,6 +16,7 @@ dependencies = [
   "reportlab>=4.2,<5",
   "sentence-transformers>=3,<6",
   "streamlit>=1.40,<2",
+  "torch>=2.2,<3",
 ]
 
 [project.optional-dependencies]

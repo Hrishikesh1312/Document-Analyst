@@ -68,6 +68,8 @@ class AppSettings:
     retrieval_min_score: float = 0.25
     max_history_turns: int = 5
     max_file_size_mb: int = 50
+    embedding_batch_size: int = 32
+    chunking_mode: str = "semantic"
     semantic_threshold: float = 0.5
     enable_ocr: bool = False
     ocr_min_text_chars: int = 80
@@ -94,7 +96,10 @@ class AppSettings:
         self.top_k = max(1, min(int(self.top_k), 50))
         self.retrieval_min_score = max(-1.0, min(float(self.retrieval_min_score), 1.0))
         self.max_history_turns = max(0, min(int(self.max_history_turns), 50))
+        self.embedding_batch_size = max(1, min(int(self.embedding_batch_size), 256))
         self.max_file_size_mb = max(1, min(int(self.max_file_size_mb), 2_048))
+        if self.chunking_mode not in {"fast", "semantic"}:
+            self.chunking_mode = "semantic"
         self.semantic_threshold = max(-1.0, min(float(self.semantic_threshold), 1.0))
         self.ocr_min_text_chars = max(0, min(int(self.ocr_min_text_chars), 10_000))
         self.ocr_zoom = max(1.0, min(float(self.ocr_zoom), 5.0))

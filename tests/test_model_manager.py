@@ -3,13 +3,81 @@ from __future__ import annotations
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import Mock, patch
+from types import SimpleNamespace
 
 from document_analyst.config import AppSettings
-from document_analyst.services.model_manager import ModelManager, discover_model_repositories
+from document_analyst.services.model_manager import (
+    ModelManager, discover_model_repositories, select_embedding_device,
+)
 
 
 class ModelManagerTests(unittest.TestCase):
+    def _torch(self, cuda: bool, mps: bool | None):
+        backends = SimpleNamespace()
+        if mps is not None:
+            backends.mps = SimpleNamespace(is_available=Mock(return_value=mps))
+        return SimpleNamespace(
+            cuda=SimpleNamespace(is_available=Mock(return_value=cuda)), backends=backends
+        )
+
+    def test_embedding_device_precedence_and_cpu_fallback(self) -> None:
+        for cuda, mps, expected in (
+            (True, True, "cuda"), (True, False, "cuda"),
+            (False, True, "mps"), (False, False, "cpu"), (False, None, "cpu"),
+        ):
+            with self.subTest(cuda=cuda, mps=mps):
+                torch = self._torch(cuda, mps)
+                with patch.dict("sys.modules", {"torch": torch}):
+                    self.assertEqual(select_embedding_device(), expected)
+                if cuda and mps is not None:
+                    torch.backends.mps.is_available.assert_not_called()
+
+    def test_embedding_pipeline_loads_once_on_selected_device(self) -> None:
+        from document_analyst.services.rag import RagService
+
+        for cuda, mps, expected in ((True, True, "cuda"), (False, True, "mps"), (False, False, "cpu")):
+            with self.subTest(device=expected):
+                manager = ModelManager(AppSettings())
+                self.assertIsNone(manager.embedding_device)
+                model = Mock()
+                model.encode.return_value.tolist.return_value = [[1.0, 0.0]]
+                constructor = Mock(return_value=model)
+                service = RagService.__new__(RagService)
+                service.models = manager
+                service.settings = manager.settings
+                service._embedder = None
+                with patch.dict("sys.modules", {
+                    "torch": self._torch(cuda, mps),
+                    "sentence_transformers": SimpleNamespace(SentenceTransformer=constructor),
+                }), patch.object(manager, "ensure_embedding_model", return_value=Path("/models/search")), patch.object(
+                    manager, "_embedding_download_complete", return_value=True
+                ):
+                    self.assertEqual(service._embed_texts(["document passage"]), [[1.0, 0.0]])
+                    self.assertEqual(service._embed_texts(["search question"]), [[1.0, 0.0]])
+                constructor.assert_called_once_with("/models/search", device=expected, local_files_only=True)
+                self.assertEqual(manager.embedding_device, expected)
+                self.assertEqual(model.encode.call_count, 2)
+                model.encode.assert_called_with(
+                    ["search question"], batch_size=32, show_progress_bar=False,
+                    convert_to_numpy=True, normalize_embeddings=True,
+                )
+
+    def test_gpu_load_failure_does_not_silently_retry_on_cpu(self) -> None:
+        manager = ModelManager(AppSettings())
+        constructor = Mock(side_effect=RuntimeError("GPU out of memory"))
+        with patch.dict("sys.modules", {
+            "torch": self._torch(True, False),
+            "sentence_transformers": SimpleNamespace(SentenceTransformer=constructor),
+        }), patch.object(manager, "ensure_embedding_model", return_value=Path("/models/search")), patch.object(
+                    manager, "_embedding_download_complete", return_value=True
+                ):
+            with self.assertRaisesRegex(RuntimeError, "GPU out of memory"):
+                manager.load_embedder()
+        self.assertEqual(constructor.call_count, 1)
+        self.assertEqual(constructor.call_args.kwargs["device"], "cuda")
+        self.assertIsNone(manager.embedding_device)
+
     def test_embedding_download_requires_config_and_weights(self) -> None:
         with tempfile.TemporaryDirectory() as temporary:
             directory = Path(temporary)

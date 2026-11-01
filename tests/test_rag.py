@@ -18,6 +18,15 @@ class RagServiceTests(unittest.TestCase):
         self.service.store = MagicMock()
         self.service.models = MagicMock()
 
+    def test_embedding_encode_uses_configured_batch_size(self) -> None:
+        self.service.settings.embedding_batch_size = 64
+        model = MagicMock()
+        model.encode.return_value.tolist.return_value = [[1.0, 0.0]]
+        self.service.ensure_embedder.return_value = model
+        RagService._embed_texts(self.service, ["A passage."])
+        self.assertEqual(model.encode.call_args.kwargs["batch_size"], 64)
+        self.assertTrue(model.encode.call_args.kwargs["normalize_embeddings"])
+
     def test_retrieval_forwards_scope_and_threshold(self) -> None:
         self.service.store.hybrid_query.return_value = HybridQueryResult([], [], 1.0, 2.0, 3.0)
 

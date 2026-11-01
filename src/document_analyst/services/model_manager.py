@@ -35,6 +35,18 @@ from document_analyst.config import AppSettings, MODELS_DIR
 DownloadProgress = Callable[[str, str, int, int | None], None]
 
 
+def select_embedding_device() -> str:
+    """Select an available accelerator when the embedding runtime is first needed."""
+    import torch
+
+    if torch.cuda.is_available():
+        return "cuda"
+    mps = getattr(torch.backends, "mps", None)
+    if mps is not None and mps.is_available():
+        return "mps"
+    return "cpu"
+
+
 def discover_model_repositories(limit: int = 5) -> tuple[list[str], list[str]]:
     """Return a small, current catalog of public embedding and local GGUF models."""
     embedding_models = list_models(
@@ -101,6 +113,7 @@ def _progress_tqdm(progress: DownloadProgress, phase: str) -> type[tqdm]:
 class ModelManager:
     def __init__(self, settings: AppSettings) -> None:
         self.settings = settings
+        self.embedding_device: str | None = None
 
     def ensure_embedding_model(self, progress: DownloadProgress | None = None) -> Path:
         target = Path(self.settings.embeddings_dir)
@@ -179,7 +192,11 @@ class ModelManager:
             raise FileNotFoundError(
                 "Embedding model is missing or incomplete. Download missing models in Settings."
             )
-        return SentenceTransformer(str(model_dir), device="cpu", local_files_only=True)
+        device = select_embedding_device()
+        embedder = SentenceTransformer(str(model_dir), device=device, local_files_only=True)
+        self.embedding_device = device
+        logging.getLogger(__name__).info("Embedding model loaded on %s", device)
+        return embedder
 
     def delete_downloaded_models(self) -> None:
         """Delete every model managed by this application, including old selections."""

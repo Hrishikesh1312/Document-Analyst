@@ -18,6 +18,10 @@ except ImportError:  # pragma: no cover
 from document_analyst.config import AppSettings
 from document_analyst.models import ChunkRecord, DocumentRecord, PageSpan
 
+class IndexingCancelled(Exception):
+    """Raised at a safe checkpoint when indexing is cancelled."""
+
+
 IndexProgress = Callable[[str, str, int, int, bool], None]
 
 
@@ -93,10 +97,14 @@ class DocumentIngestor:
                 progress("reading", path.name, index, total, True)
         return documents, warnings
 
-    def load_document(self, path: Path) -> DocumentRecord:
+    def load_document(
+        self, path: Path,
+        page_progress: Callable[[int, int, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> DocumentRecord:
         suffix = path.suffix.lower()
         if suffix == ".pdf":
-            page_spans = self._read_pdf(path)
+            page_spans = self._read_pdf(path, page_progress, should_cancel)
             text = "\n\n".join(page.text for page in page_spans)
         elif suffix == ".docx":
             page_spans = self._read_docx(path)
@@ -141,17 +149,29 @@ class DocumentIngestor:
                 continue
         raise UnicodeDecodeError("text", b"", 0, 1, "Unsupported text encoding")
 
-    def _read_pdf(self, path: Path) -> list[PageSpan]:
+    def _read_pdf(
+        self, path: Path,
+        progress: Callable[[int, int, str], None] | None = None,
+        should_cancel: Callable[[], bool] | None = None,
+    ) -> list[PageSpan]:
         spans: list[PageSpan] = []
         with pymupdf.open(path) as doc:
             for index, page in enumerate(doc, start=1):
+                if should_cancel and should_cancel():
+                    raise IndexingCancelled()
+                if progress:
+                    progress(index - 1, len(doc), "Reading")
                 text = page.get_text("text").strip()
                 if self._should_run_ocr(text):
+                    if progress:
+                        progress(index - 1, len(doc), "Recognizing scanned text")
                     ocr_text = self._ocr_page(page).strip()
                     if len(ocr_text) > len(text):
                         text = ocr_text
                 if text:
                     spans.append(PageSpan(page_number=index, text=text))
+                if progress:
+                    progress(index, len(doc), "Read")
         return spans
 
     def _read_docx(self, path: Path) -> list[PageSpan]:
@@ -216,7 +236,9 @@ class DocumentIngestor:
         if not sentences:
             return []
 
-        sentence_embeddings = embed_texts(sentences)
+        sentence_embeddings = (
+            embed_texts(sentences) if self.settings.chunking_mode == "semantic" else None
+        )
         chunks: list[ChunkRecord] = []
         current_sentences: list[str] = []
         current_pages: list[int] = []
@@ -225,13 +247,13 @@ class DocumentIngestor:
 
         for index, sentence in enumerate(sentences):
             similarity = 1.0
-            if index > 0:
+            if sentence_embeddings is not None and index > 0:
                 previous = sentence_embeddings[index - 1]
                 current = sentence_embeddings[index]
                 similarity = sum(a * b for a, b in zip(previous, current))
 
             proposed_chars = current_chars + len(sentence) + 1
-            semantic_break = similarity < self.settings.semantic_threshold and current_chars >= self.settings.chunk_overlap
+            semantic_break = sentence_embeddings is not None and similarity < self.settings.semantic_threshold and current_chars >= self.settings.chunk_overlap
             size_break = proposed_chars > self.settings.chunk_size and current_sentences
 
             if semantic_break or size_break:

@@ -22,6 +22,11 @@ class SettingsTests(unittest.TestCase):
         self.assertEqual(settings.retrieval_min_score, 1.0)
         self.assertEqual(settings.supported_extensions, [".pdf", ".txt"])
 
+    def test_chunking_mode_is_backward_compatible_and_validated(self) -> None:
+        self.assertEqual(AppSettings().chunking_mode, "semantic")
+        self.assertEqual(AppSettings(chunking_mode="unknown").chunking_mode, "semantic")
+        self.assertEqual(AppSettings(chunking_mode="fast").chunking_mode, "fast")
+
     def test_office_formats_are_supported_by_default(self) -> None:
         settings = AppSettings()
         self.assertIn(".docx", settings.supported_extensions)

@@ -10,4 +10,5 @@ reportlab>=4.2,<5
 sentence-transformers>=3,<6
 streamlit>=1.40,<2
 tqdm>=4.27,<5
-torchvision
+torch>=2.2,<3
+torchvision==0.29.1
