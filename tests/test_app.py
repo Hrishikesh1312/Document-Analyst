@@ -619,6 +619,43 @@ class UiFoundationTests(unittest.TestCase):
         self.assertFalse(app.exception)
         self.assertEqual(app.markdown[-1].value, "Library")
 
+    def test_fresh_sessions_start_new_chats_and_saved_chats_remain_available(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "conversations.json"
+            store = ConversationStore(path)
+            old = store.create("Saved conversation")
+            store.save_conversation(old["id"], "Saved conversation",
+                                    [{"role": "user", "content": "An earlier question"}], {})
+            script = dedent(f"""
+                from pathlib import Path
+                from document_analyst.app import _initialize_conversation_state, _conversation_panel
+                from document_analyst.services.conversation_store import ConversationStore
+                from document_analyst.ui.state import initialize_session_state
+                initialize_session_state()
+                store = ConversationStore(Path({str(path)!r}))
+                _initialize_conversation_state(store)
+                _conversation_panel(store)
+            """)
+            app = AppTest.from_string(script, default_timeout=15).run()
+            self.assertFalse(app.exception)
+            fresh_id = app.session_state.active_conversation_id
+            self.assertNotEqual(fresh_id, old["id"])
+            self.assertEqual(app.session_state.messages, [])
+            self.assertEqual(app.selectbox[0].value, fresh_id)
+            app.run()
+            self.assertEqual(app.session_state.active_conversation_id, fresh_id)
+            self.assertEqual(len(store.list()), 2)
+            app.selectbox[0].set_value(old["id"]).run()
+            self.assertFalse(app.exception)
+            self.assertEqual(app.session_state.messages[0]["content"], "An earlier question")
+            app.run()
+            self.assertEqual(app.session_state.active_conversation_id, old["id"])
+            another_session = AppTest.from_string(script, default_timeout=15).run()
+            self.assertFalse(another_session.exception)
+            self.assertNotIn(another_session.session_state.active_conversation_id, [old["id"], fresh_id])
+            self.assertEqual(another_session.session_state.messages, [])
+            self.assertEqual(len(store.list()), 3)
+
     def test_deleting_active_conversation_selects_replacement_safely(self) -> None:
         with tempfile.TemporaryDirectory() as directory:
             store_path = Path(directory) / "conversations.json"

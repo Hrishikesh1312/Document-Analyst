@@ -279,13 +279,6 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
     with tools_column.popover("Search tools", use_container_width=True):
         st.text_input("Search retrieved evidence", key="evidence_search", placeholder="Find text in source passages")
         st.toggle("Show retrieval diagnostics", key="show_retrieval_diagnostics")
-        if st.session_state.pinned_source_paths or st.session_state.excluded_source_paths:
-            st.caption(f"Next answer: {len(st.session_state.pinned_source_paths)} pinned, "
-                       f"{len(st.session_state.excluded_source_paths)} excluded sources.")
-            if st.button("Clear next-response source rules", use_container_width=True):
-                st.session_state.pinned_source_paths = []
-                st.session_state.excluded_source_paths = []
-                st.rerun()
     scope = st.session_state.get("chat_document_filter", [])
     scope_label = f"{len(scope)} selected documents" if scope else "All documents"
     st.caption(f"{st.session_state.conversation_name} · {scope_label}")
@@ -332,8 +325,6 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
                         prompt,
                         st.session_state.messages[:-1],
                         source_paths=source_paths,
-                        pinned_source_paths=st.session_state.pinned_source_paths,
-                        excluded_source_paths=st.session_state.excluded_source_paths,
                     )
                     answer = st.write_stream(result.chunks)
             except (OSError, RuntimeError, ValueError) as exc:
@@ -353,8 +344,6 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
             if st.session_state.conversation_name == "New conversation":
                 st.session_state.conversation_name = prompt.strip()[:60] or "New conversation"
             _persist_current_conversation(conversation_store)
-            st.session_state.pinned_source_paths = []
-            st.session_state.excluded_source_paths = []
         st.rerun()
 
 def _help_tab() -> None:
@@ -383,7 +372,7 @@ def _help_tab() -> None:
             "candidate passages, which are reranked and selected across documents. The local "
             "answer model uses these passages and cites them as **[S1]**, **[S2]**, and so on.\n\n"
             "Open **Sources** below an answer to check its evidence. Use **Search retrieved evidence** "
-            "to find text within those passages. Pin or exclude a source to control the next response.\n\n"
+            "to find text within those passages.\n\n"
             "Under **Search scope**, select documents to limit your search; leave it empty to search "
             "the full index. Open **Search tools** and enable **Show retrieval diagnostics** to inspect search scores and timings. "
             "The relevance threshold is in Settings; strong keyword matches can still qualify below it.\n\n"
@@ -1034,8 +1023,8 @@ def _sources_panel(sources, anchor_prefix: str) -> None:
         for source in visible_sources
     )
     st.markdown(f"Jump to evidence: {links}")
-    for card_index, source in enumerate(visible_sources):
-        _source_card(source, anchor_prefix, card_index, search)
+    for source in visible_sources:
+        _source_card(source, anchor_prefix, search=search)
 
 
 def _diagnostics_panel(diagnostics) -> None:
@@ -1075,9 +1064,9 @@ def _diagnostics_panel(diagnostics) -> None:
 def _initialize_conversation_state(store: ConversationStore) -> None:
     if st.session_state.get("conversation_loaded"):
         return
-    conversations = store.list()
-    conversation = conversations[0] if conversations else store.create()
+    conversation = store.create()
     _load_conversation(conversation)
+    st.session_state.pending_conversation_id = conversation["id"]
 
 
 def _load_conversation(conversation: dict) -> None:
@@ -1196,7 +1185,7 @@ def _conversation_panel(store: ConversationStore) -> None:
 
 
 def _source_card(
-    source, anchor_prefix: str = "source", card_index: int = 0, search: str = ""
+    source, anchor_prefix: str = "source", search: str = ""
 ) -> None:
     source_id = html.escape(str(source.source_id))
     document_name = html.escape(str(source.document_name))
@@ -1216,33 +1205,6 @@ def _source_card(
         """,
         unsafe_allow_html=True,
     )
-    action_key = hashlib.sha256(
-        f"{anchor_prefix}:{card_index}:{source.source_path}".encode("utf-8")
-    ).hexdigest()[:16]
-    open_column, pin_column, exclude_column = st.columns(3)
-    if Path(source.source_path).suffix.lower() == ".pdf":
-        target = Path(source.source_path).resolve().as_uri() + f"#page={source.approx_page}"
-        open_column.markdown(f"[Open PDF at page {source.approx_page}]({target})")
-    else:
-        open_column.markdown(f"[Open source file]({Path(source.source_path).resolve().as_uri()})")
-    if pin_column.button("Pin next", key=f"pin-{action_key}", use_container_width=True):
-        pinned = set(st.session_state.pinned_source_paths)
-        excluded = set(st.session_state.excluded_source_paths)
-        pinned.add(source.source_path)
-        excluded.discard(source.source_path)
-        st.session_state.pinned_source_paths = sorted(pinned)
-        st.session_state.excluded_source_paths = sorted(excluded)
-        st.rerun()
-    if exclude_column.button(
-        "Exclude next", key=f"exclude-{action_key}", use_container_width=True
-    ):
-        pinned = set(st.session_state.pinned_source_paths)
-        excluded = set(st.session_state.excluded_source_paths)
-        excluded.add(source.source_path)
-        pinned.discard(source.source_path)
-        st.session_state.pinned_source_paths = sorted(pinned)
-        st.session_state.excluded_source_paths = sorted(excluded)
-        st.rerun()
 
 
 def _highlight_text(text: str, search: str) -> str:
