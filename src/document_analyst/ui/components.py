@@ -6,9 +6,9 @@ import streamlit as st
 
 
 VIEW_DETAILS = {
-    "Ask": ("Ask", "Query your local knowledge base and verify every answer."),
-    "Library": ("Document library", "Index, inspect, and maintain your local sources."),
-    "Settings": ("Models & settings", "Configure local inference and retrieval behavior."),
+    "Ask": ("Ask your documents", "Find answers, explore ideas, and check the sources."),
+    "Library": ("Document library", "Your documents, ready to explore."),
+    "Settings": ("Settings", "Manage your models and tailor your workspace."),
     "Help": ("Help", "Get started, understand answers, and find troubleshooting guidance."),
 }
 
@@ -45,7 +45,6 @@ def page_heading(view: str) -> None:
     st.markdown(
         f"""
         <div class="da-page-heading">
-            <div class="da-eyebrow">Local knowledge workspace</div>
             <h1>{html.escape(title)}</h1>
             <p>{html.escape(description)}</p>
         </div>

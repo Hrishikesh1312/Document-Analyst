@@ -6,16 +6,16 @@ import streamlit as st
 THEME_CSS = """
 <style>
 :root {
-    --da-bg: #0b0f14;
-    --da-sidebar: #10161d;
-    --da-surface: #151d26;
+    --da-bg: #0d1117;
+    --da-sidebar: #10151c;
+    --da-surface: #151c24;
     --da-surface-raised: #1a242f;
     --da-border: #26313d;
     --da-border-strong: #354455;
-    --da-text: #f2f5f7;
-    --da-muted: #94a3b3;
-    --da-accent: #4f806c;
-    --da-accent-soft: rgba(79, 128, 108, 0.12);
+    --da-text: #eef2f6;
+    --da-muted: #a1adba;
+    --da-accent: #84cbb8;
+    --da-accent-soft: rgba(132, 203, 184, 0.10);
     --da-warning: #f6b94a;
     --da-error: #f36c75;
     --da-radius: 12px;
@@ -27,8 +27,8 @@ THEME_CSS = """
 }
 
 .block-container {
-    max-width: 1440px;
-    padding-top: 1.5rem;
+    max-width: 1180px;
+    padding-top: 2.25rem;
     padding-bottom: 3rem;
 }
 
@@ -105,16 +105,8 @@ THEME_CSS = """
 .da-sidebar-stat { color: var(--da-muted); font-size: .72rem; }
 .da-sidebar-stat strong { color: var(--da-text); display: block; font-size: 1rem; }
 
-.da-page-heading { margin-bottom: 1.4rem; }
-.da-eyebrow {
-    color: var(--da-accent);
-    font-size: .72rem;
-    font-weight: 700;
-    letter-spacing: .1em;
-    margin-bottom: .35rem;
-    text-transform: uppercase;
-}
-.da-page-heading h1 { font-size: 2rem; letter-spacing: -.04em; margin: 0; }
+.da-page-heading { margin: .25rem 0 1.75rem; }
+.da-page-heading h1 { font-size: 2.2rem; font-weight: 700; letter-spacing: -.045em; margin: 0; }
 .da-page-heading p { color: var(--da-muted); margin: .4rem 0 0; max-width: 700px; }
 
 .da-panel, .source-card, .metric-card {
@@ -139,7 +131,7 @@ THEME_CSS = """
     margin-bottom: .45rem;
 }
 .da-model-role { font-size: .78rem; font-weight: 700; letter-spacing: .03em; }
-.da-model-name { font-size: 1rem; font-weight: 650; margin-bottom: .3rem; }
+.da-model-name { font-size: 1.05rem; font-weight: 650; margin-bottom: .3rem; }
 .da-model-detail { color: var(--da-muted); font-size: .78rem; overflow-wrap: anywhere; }
 .da-badge {
     border: 1px solid var(--da-border-strong);
@@ -200,17 +192,18 @@ code { color: var(--da-accent); }
 
 div.stButton > button, div.stDownloadButton > button { border-radius: 9px; }
 button[kind="primary"] {
-    background: #294b3e;
-    border-color: #426b58;
-    color: var(--da-text);
+    background: var(--da-accent);
+    border-color: var(--da-accent);
+    color: #0b241d;
+    font-weight: 650;
 }
 button[kind="primary"]:hover:not(:disabled) {
-    background: #335b4b;
-    border-color: #608f78;
-    color: var(--da-text);
+    background: #a1ddcd;
+    border-color: #a1ddcd;
+    color: #0b241d;
 }
 button[kind="primary"]:active:not(:disabled) {
-    background: #234034;
+    background: #73b6a3;
 }
 button[kind="primary"]:focus-visible {
     outline: 2px solid #86b39b;
@@ -230,9 +223,26 @@ button[kind="primary"]:disabled {
 }
 [data-testid="stExpander"] { border-color: var(--da-border); border-radius: var(--da-radius); }
 
+.da-document-title { font-size: 1rem; font-weight: 600; overflow-wrap: anywhere; }
+.da-document-title .da-badge { display: inline-block; margin-left: .5rem; vertical-align: middle; }
+.da-badge.attention { background: rgba(246,185,74,.08); border-color: rgba(246,185,74,.3); color: var(--da-warning); }
+[data-testid="stChatMessage"] { max-width: 960px; margin: .5rem auto; line-height: 1.65; }
+[data-testid="stChatInput"] { max-width: 960px; margin: 0 auto; border-radius: 14px; }
+[data-testid="stChatMessage"]:has([data-testid="chatAvatarIcon-user"]) {
+    background: var(--da-surface); border-radius: var(--da-radius); padding: 1rem;
+}
+[data-testid="stPopover"] button { min-height: 42px; }
+[data-testid="stPopoverBody"] { max-width: min(580px, calc(100vw - 2rem)); }
+[data-testid="stDialog"] [data-testid="stText"] { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.6; }
+button:focus-visible, input:focus-visible, [role="combobox"]:focus-visible {
+    outline: 2px solid var(--da-accent); outline-offset: 3px;
+}
+
 @media (max-width: 900px) {
     .block-container { padding-left: 1rem; padding-right: 1rem; }
-    .da-page-heading h1 { font-size: 1.65rem; }
+    .block-container { padding-top: 1.25rem; }
+    .da-page-heading h1 { font-size: 1.8rem; }
+    .da-document-title .da-badge { margin-left: 0; }
 }
 </style>
 """

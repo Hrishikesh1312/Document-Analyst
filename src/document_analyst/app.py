@@ -262,104 +262,100 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
     document_labels = {
         str(item["source_path"]): str(item["document_name"]) for item in indexed_documents
     }
-    left, right = st.columns([1.65, 1], gap="large")
-    with left:
-        if not st.session_state.messages:
-            empty_state(
-                "Start with a question",
-                "Ask for an explanation, comparison, summary, or supporting passage from your indexed documents.",
-                "⌕",
-            )
-        for index, message in enumerate(st.session_state.messages):
-            with st.chat_message(message["role"]):
-                if message["role"] == "assistant":
-                    st.markdown(_citation_links(message["content"], index))
-                    with st.expander("Copy answer with citations", expanded=False):
-                        st.code(message["content"], language=None)
-                else:
-                    st.markdown(message["content"])
-                if message["role"] == "assistant":
-                    sources = st.session_state.sources_by_turn.get(index, [])
-                    if sources:
-                        with st.expander("Sources", expanded=False):
-                            _sources_panel(sources, f"turn-{index}")
-                    diagnostics = st.session_state.diagnostics_by_turn.get(index)
-                    if diagnostics and st.session_state.show_retrieval_diagnostics:
-                        with st.expander("Retrieval diagnostics", expanded=False):
-                            _diagnostics_panel(diagnostics)
-
-        prompt = st.chat_input("Ask about your indexed documents")
-        if prompt:
-            st.session_state.messages.append({"role": "user", "content": prompt})
-            with st.chat_message("user"):
-                st.markdown(prompt)
-
-            with st.chat_message("assistant"):
-                try:
-                    with st.spinner("Searching your local index and generating a response..."):
-                        selected_paths = st.session_state.get("chat_document_filter", [])
-                        source_paths = selected_paths or None
-                        result = service.answer_question_stream(
-                            prompt,
-                            st.session_state.messages[:-1],
-                            source_paths=source_paths,
-                            pinned_source_paths=st.session_state.pinned_source_paths,
-                            excluded_source_paths=st.session_state.excluded_source_paths,
-                        )
-                        answer = st.write_stream(result.chunks)
-                except (OSError, RuntimeError, ValueError) as exc:
-                    st.error(f"Could not answer the question: {exc}")
-                    st.session_state.messages.pop()
-                    return
-                turn_index = len(st.session_state.messages)
-                with st.expander("Sources", expanded=True):
-                    _sources_panel(result.sources, f"turn-{turn_index}")
-                if result.diagnostics and st.session_state.show_retrieval_diagnostics:
-                    with st.expander("Retrieval diagnostics", expanded=True):
-                        _diagnostics_panel(result.diagnostics)
-                st.session_state.messages.append({"role": "assistant", "content": str(answer)})
-                st.session_state.sources_by_turn[turn_index] = result.sources
-                if result.diagnostics:
-                    st.session_state.diagnostics_by_turn[turn_index] = result.diagnostics
-                if st.session_state.conversation_name == "New conversation":
-                    st.session_state.conversation_name = prompt.strip()[:60] or "New conversation"
-                _persist_current_conversation(conversation_store)
-                st.session_state.pinned_source_paths = []
-                st.session_state.excluded_source_paths = []
-            st.rerun()
-
-    with right:
+    conversation_column, scope_column, tools_column = st.columns([1.2, 1, 1], gap="small")
+    with conversation_column.popover("Conversations", use_container_width=True):
         _conversation_panel(conversation_store)
-        st.markdown("#### Retrieval tools")
-        st.toggle(
-            "Show retrieval diagnostics",
-            key="show_retrieval_diagnostics",
-            help="Inspect hybrid-search candidates, score components, document coverage, and timing.",
+    with scope_column.popover("Search scope", use_container_width=True):
+        st.markdown("#### Search in")
+        selected = st.session_state.get("chat_document_filter", [])
+        if any(path not in document_labels for path in selected):
+            st.session_state.chat_document_filter = [path for path in selected if path in document_labels]
+        st.multiselect(
+            "Documents", options=list(document_labels),
+            format_func=lambda path: document_labels.get(path, Path(path).name),
+            placeholder="All indexed documents", key="chat_document_filter",
+            help="Leave empty to search the entire library.",
         )
-        st.text_input(
-            "Search retrieved evidence",
-            key="evidence_search",
-            placeholder="Highlight or filter source passages",
-        )
+    with tools_column.popover("Search tools", use_container_width=True):
+        st.text_input("Search retrieved evidence", key="evidence_search", placeholder="Find text in source passages")
+        st.toggle("Show retrieval diagnostics", key="show_retrieval_diagnostics")
         if st.session_state.pinned_source_paths or st.session_state.excluded_source_paths:
-            st.caption(
-                f"Next response: {len(st.session_state.pinned_source_paths)} pinned, "
-                f"{len(st.session_state.excluded_source_paths)} excluded."
-            )
+            st.caption(f"Next answer: {len(st.session_state.pinned_source_paths)} pinned, "
+                       f"{len(st.session_state.excluded_source_paths)} excluded sources.")
             if st.button("Clear next-response source rules", use_container_width=True):
                 st.session_state.pinned_source_paths = []
                 st.session_state.excluded_source_paths = []
                 st.rerun()
-        st.markdown("#### Search scope")
-        st.multiselect(
-            "Documents",
-            options=list(document_labels),
-            format_func=lambda path: document_labels.get(path, Path(path).name),
-            placeholder="All indexed documents",
-            key="chat_document_filter",
-            help="Leave empty to search the entire index.",
-        )
+    scope = st.session_state.get("chat_document_filter", [])
+    scope_label = f"{len(scope)} selected documents" if scope else "All documents"
+    st.caption(f"{st.session_state.conversation_name} · {scope_label}")
 
+    if not st.session_state.messages:
+        if document_labels:
+            empty_state("What would you like to understand?",
+                        "Ask a question, compare ideas, or find a passage in your documents.", "⌕")
+        else:
+            empty_state("Add your first documents", "Build a library, then ask questions with sources you can check.", "▤")
+            if st.button("Go to Library", type="primary"):
+                st.session_state.active_view = "Library"
+                st.rerun()
+    for index, message in enumerate(st.session_state.messages):
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant":
+                st.markdown(_citation_links(message["content"], index))
+                with st.expander("Copy answer with citations", expanded=False):
+                    st.code(message["content"], language=None)
+            else:
+                st.markdown(message["content"])
+            if message["role"] == "assistant":
+                sources = st.session_state.sources_by_turn.get(index, [])
+                if sources:
+                    with st.expander("Sources", expanded=False):
+                        _sources_panel(sources, f"turn-{index}")
+                diagnostics = st.session_state.diagnostics_by_turn.get(index)
+                if diagnostics and st.session_state.show_retrieval_diagnostics:
+                    with st.expander("Retrieval diagnostics", expanded=False):
+                        _diagnostics_panel(diagnostics)
+
+    prompt = st.chat_input("Ask a question about your documents…", disabled=not bool(document_labels))
+    if prompt:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            try:
+                with st.spinner("Searching your local index and generating a response..."):
+                    selected_paths = st.session_state.get("chat_document_filter", [])
+                    source_paths = selected_paths or None
+                    result = service.answer_question_stream(
+                        prompt,
+                        st.session_state.messages[:-1],
+                        source_paths=source_paths,
+                        pinned_source_paths=st.session_state.pinned_source_paths,
+                        excluded_source_paths=st.session_state.excluded_source_paths,
+                    )
+                    answer = st.write_stream(result.chunks)
+            except (OSError, RuntimeError, ValueError) as exc:
+                st.error(f"Could not answer the question: {exc}")
+                st.session_state.messages.pop()
+                return
+            turn_index = len(st.session_state.messages)
+            with st.expander("Sources", expanded=True):
+                _sources_panel(result.sources, f"turn-{turn_index}")
+            if result.diagnostics and st.session_state.show_retrieval_diagnostics:
+                with st.expander("Retrieval diagnostics", expanded=True):
+                    _diagnostics_panel(result.diagnostics)
+            st.session_state.messages.append({"role": "assistant", "content": str(answer)})
+            st.session_state.sources_by_turn[turn_index] = result.sources
+            if result.diagnostics:
+                st.session_state.diagnostics_by_turn[turn_index] = result.diagnostics
+            if st.session_state.conversation_name == "New conversation":
+                st.session_state.conversation_name = prompt.strip()[:60] or "New conversation"
+            _persist_current_conversation(conversation_store)
+            st.session_state.pinned_source_paths = []
+            st.session_state.excluded_source_paths = []
+        st.rerun()
 
 def _help_tab() -> None:
     page_heading("Help")
@@ -367,7 +363,7 @@ def _help_tab() -> None:
         st.markdown(
             "1. In the welcome popup, choose **Proceed with recommended settings** to download "
             "the search and answer models. You can also download or change models in **Settings**.\n"
-            "2. In **Library**, choose your documents folder and click **Build Index**.\n"
+            "2. In **Library**, open **Add a document folder**, choose your folder, and click **Build Index**.\n"
             "3. Open **Ask** and ask a question about your indexed documents.\n\n"
             "In **Library**, search by document name or folder path and filter by indexing status "
             "or file type. Use **Clear filters** to see all documents. Results are paginated. "
@@ -375,7 +371,7 @@ def _help_tab() -> None:
         )
     with st.expander("Conversations and downloads"):
         st.markdown(
-            "Use the **Conversations** selector in Ask to reopen a saved chat. "
+            "Open the **Conversations** menu in Ask to reopen a saved chat. "
             "You can create, rename, or delete conversations there.\n\n"
             "Under **Download conversation**, choose **Download Markdown (.md)** for an editable "
             "text file or **Download PDF (.pdf)** for a document you can print or share. "
@@ -389,7 +385,7 @@ def _help_tab() -> None:
             "Open **Sources** below an answer to check its evidence. Use **Search retrieved evidence** "
             "to find text within those passages. Pin or exclude a source to control the next response.\n\n"
             "Under **Search scope**, select documents to limit your search; leave it empty to search "
-            "the full index. Enable **Show retrieval diagnostics** to inspect search scores and timings. "
+            "the full index. Open **Search tools** and enable **Show retrieval diagnostics** to inspect search scores and timings. "
             "The relevance threshold is in Settings; strong keyword matches can still qualify below it.\n\n"
             "Only the latest conversation window is sent to the answer model to limit processing time. "
             "Change its length in advanced settings."
@@ -404,7 +400,7 @@ def _help_tab() -> None:
             "during indexing. After several batches, the panel shows throughput and an estimate for the "
             "current stage only. Overall progress is approximate because stages and file sizes vary. "
             "Cancellation takes effect at a safe checkpoint.\n\n"
-            "In **Library → Indexing performance**, choose **Fast**, **Balanced**, or **Quality** "
+            "In **Library → Performance options**, choose **Fast**, **Balanced**, or **Quality** "
             "and click **Apply performance settings**. Fast uses larger sentence-based passages; "
             "Balanced uses smaller sentence-based passages; Quality uses semantic chunking. "
             "Batch size controls how many passages the model processes together. "
@@ -434,11 +430,11 @@ def _help_tab() -> None:
 
 def _docs_tab(settings: AppSettings, service: RagService) -> None:
     page_heading("Library")
+    docs = service.document_statuses()
     active_job = st.session_state.get("index_job")
     indexing = bool(active_job and active_job.thread and active_job.thread.is_alive())
-    col1, col2 = st.columns([1.3, 1], gap="large")
-    with col1:
-        st.subheader("Index a Folder")
+    add_column, performance_column = st.columns(2, gap="medium")
+    with add_column.expander("Add a document folder", expanded=not bool(docs)):
         with st.form("index-form", clear_on_submit=False):
             directory = st.text_input(
                 "Local documents folder",
@@ -467,15 +463,12 @@ def _docs_tab(settings: AppSettings, service: RagService) -> None:
             _start_index_job(service, settings.documents_dir, replace_existing)
             st.rerun()
 
-        if st.session_state.index_job:
-            _index_job_panel(service)
-
-    with col2:
+    with performance_column.expander("Performance options", expanded=False):
         _indexing_performance_controls(settings, service, indexing)
+    if st.session_state.index_job:
+        _index_job_panel(service)
 
-    st.write("")
-    st.subheader("Indexed Documents")
-    docs = service.document_statuses()
+    st.subheader("Your documents")
     if not docs:
         empty_state(
             "Your library is empty",
@@ -515,38 +508,44 @@ def _library_documents_panel(service: RagService, documents: list[dict], indexin
     page = int(st.number_input("Library page", 1, pages, 1, key=f"library-page-{filter_id}")) if pages > 1 else 1
     for item in docs[(page - 1) * page_size:page * page_size]:
         document_name = html.escape(str(item["document_name"]))
-        source_path = html.escape(str(item["source_path"]))
-        with st.container():
-            st.markdown(
-                f"""
-                <div class="source-card">
-                    <strong>{document_name}</strong><br/>
-                    <span class="muted">{source_path}</span><br/>
-                    <span class="accent">{item.get("chunks", 0)} chunks • {item.get("status", "indexed")}</span><br/>
-                    <span class="muted">Indexed: {item.get("indexed_at") or "Not yet"}</span>
-                </div>
-                """,
-                unsafe_allow_html=True,
-            )
-            if item.get("error"):
-                st.caption(f"Status detail: {item['error']}")
-            if item.get("duplicate_of"):
-                st.caption(f"Duplicate of: {item['duplicate_of']}")
-            if item.get("status") != "removed" and int(item.get("chunks", 0)) > 0:
-                if st.button("View passages", key=f"view-{item['source_path']}"):
-                    st.session_state.library_preview_path = str(item["source_path"])
-            if item.get("status") != "removed" and st.button(
-                f"Remove from index: {item['document_name']}", key=f"del-{item['source_path']}", disabled=indexing
-            ):
-                service.delete_document(str(item["source_path"]))
-                st.success(f"Removed {item['document_name']} from the index.")
-                st.rerun()
+        status = str(item.get("status", "indexed"))
+        status_class = "ready" if status == "indexed" else "attention" if status in {"failed", "cancelled"} else ""
+        with st.container(border=True):
+            name_column, view_column, manage_column = st.columns([4, 1.5, 1], vertical_alignment="center")
+            with name_column:
+                st.markdown(
+                    f'<div class="da-document-title">{document_name} '
+                    f'<span class="da-badge {status_class}">{html.escape(status.title())}</span></div>',
+                    unsafe_allow_html=True,
+                )
+                indexed = str(item.get("indexed_at") or "")[:10]
+                detail = f"{int(item.get('chunks', 0)):,} chunks"
+                if indexed:
+                    detail += f" · Indexed {indexed}"
+                st.caption(detail)
+                if item.get("error"):
+                    st.caption(f"Needs attention: {item['error']}")
+            with view_column:
+                if status != "removed" and int(item.get("chunks", 0)) > 0:
+                    if st.button("View passages", key=f"view-{item['source_path']}", use_container_width=True):
+                        _document_passages_dialog(service, item)
+            with manage_column.popover("Details", use_container_width=True):
+                st.caption("Source file")
+                st.text(str(item["source_path"]))
+                if item.get("duplicate_of"):
+                    st.caption(f"Duplicate of: {item['duplicate_of']}")
+                if status != "removed" and st.button(
+                    f"Remove from index: {item['document_name']}", key=f"del-{item['source_path']}", disabled=indexing
+                ):
+                    service.delete_document(str(item["source_path"]))
+                    st.toast(f"Removed {item['document_name']} from the index.")
+                    st.rerun()
 
-    selected_path = st.session_state.get("library_preview_path")
-    selected = next((item for item in docs if item["source_path"] == selected_path
-                     and item.get("status") != "removed" and int(item.get("chunks", 0)) > 0), None)
-    if selected:
-        _document_passages_panel(service, selected)
+
+
+@st.dialog("Document passages", width="large")
+def _document_passages_dialog(service: RagService, document: dict) -> None:
+    _document_passages_panel(service, document)
 
 
 def _document_passages_panel(service: RagService, document: dict) -> None:
@@ -767,21 +766,21 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         _ocr_setup_dialog(settings.tesseract_cmd)
     section_intro(
         "Model library",
-        "Select one model for document search and one model for answer generation.",
+        "Download models once for private search and answers on your device.",
     )
     status_left, status_right = st.columns(2, gap="medium")
     with status_left:
         model_status_card(
             "Embedding model",
             settings.embeddings_repo,
-            settings.embeddings_dir if embedding_ready else "Required to index and search documents",
+            "Ready to search your documents" if embedding_ready else "Download to index and search documents",
             embedding_ready,
         )
     with status_right:
         model_status_card(
             "Answer model",
             settings.llm_repo,
-            str(local_llm) if local_llm else "Required to generate complete answers",
+            "Ready to answer questions" if local_llm else "Download to generate answers",
             llm_ready,
         )
 
@@ -794,42 +793,6 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
 
     if catalog_warning:
         st.info("The online catalog is unavailable. Built-in model options are shown instead.")
-
-    with st.form("model-selection-form"):
-        model_left, model_right = st.columns(2, gap="medium")
-        with model_left:
-            embeddings_repo = st.selectbox(
-                "Embedding model",
-                options=embedding_options,
-                index=embedding_options.index(settings.embeddings_repo),
-                format_func=model_display_name,
-                help="Creates vector representations used to locate relevant passages.",
-            )
-            st.caption(f"Repository: `{embeddings_repo}`")
-        with model_right:
-            llm_repo = st.selectbox(
-                "Answer model",
-                options=llm_options,
-                index=llm_options.index(settings.llm_repo),
-                format_func=model_display_name,
-                help="Generates cited answers from retrieved passages using llama.cpp.",
-            )
-            st.caption(f"Repository: `{llm_repo}`")
-        apply_selection = st.form_submit_button(
-            "Apply model selection",
-            type="primary",
-            use_container_width=True,
-        )
-    if apply_selection:
-        llm_changed = llm_repo.strip() != settings.llm_repo
-        settings.embeddings_repo = embeddings_repo.strip()
-        settings.llm_repo = llm_repo.strip()
-        if llm_changed:
-            settings.llm_filename = ""
-        save_settings(settings)
-        st.session_state.settings = settings
-        st.toast("Model selection updated.", icon=":material/check_circle:")
-        st.rerun()
 
     models_ready = embedding_ready and llm_ready
     if st.button(
@@ -845,10 +808,45 @@ def _models_tab(settings: AppSettings, service: RagService) -> None:
         )
         st.rerun()
 
+    with st.expander("Change models", expanded=False):
+        with st.form("model-selection-form"):
+            model_left, model_right = st.columns(2, gap="medium")
+            with model_left:
+                embeddings_repo = st.selectbox(
+                    "Embedding model",
+                    options=embedding_options,
+                    index=embedding_options.index(settings.embeddings_repo),
+                    format_func=model_display_name,
+                    help="Creates vector representations used to locate relevant passages.",
+                )
+            with model_right:
+                llm_repo = st.selectbox(
+                    "Answer model",
+                    options=llm_options,
+                    index=llm_options.index(settings.llm_repo),
+                    format_func=model_display_name,
+                    help="Generates cited answers from retrieved passages using llama.cpp.",
+                )
+            apply_selection = st.form_submit_button(
+                "Apply model selection",
+                type="primary",
+                use_container_width=True,
+            )
+    if apply_selection:
+        llm_changed = llm_repo.strip() != settings.llm_repo
+        settings.embeddings_repo = embeddings_repo.strip()
+        settings.llm_repo = llm_repo.strip()
+        if llm_changed:
+            settings.llm_filename = ""
+        save_settings(settings)
+        st.session_state.settings = settings
+        st.toast("Model selection updated.", icon=":material/check_circle:")
+        st.rerun()
+
     st.divider()
     section_intro(
         "Advanced settings",
-        "Change retrieval, indexing, and OCR behavior only when the defaults are unsuitable.",
+        "Fine-tune search, indexing, and scanned-document support.",
     )
     show_advanced = st.toggle(
         "Enable advanced settings",

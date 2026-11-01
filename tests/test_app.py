@@ -175,6 +175,55 @@ class UiFoundationTests(unittest.TestCase):
         self.assertEqual(app.session_state.active_view, "Library")
         self.assertFalse(app.session_state.show_empty_state_dialog)
 
+    def test_chat_toolbar_preserves_scope_and_streams_saved_answers(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            store_path = str(Path(directory) / "conversations.json")
+            app = AppTest.from_string(dedent(f"""
+                import streamlit as st
+                from pathlib import Path
+                from document_analyst.app import _chat_tab, _initialize_conversation_state
+                from document_analyst.ui.state import initialize_session_state
+                from document_analyst.services.conversation_store import ConversationStore
+                from document_analyst.services.rag import AnswerStream
+
+                initialize_session_state()
+                store = ConversationStore(Path({store_path!r}))
+                _initialize_conversation_state(store)
+                class Service:
+                    def indexed_documents(self):
+                        return [{{"source_path": "/docs/book.pdf", "document_name": "book.pdf"}}]
+                    def answer_question_stream(self, prompt, history, **kwargs):
+                        st.session_state.request_scope = kwargs["source_paths"]
+                        return AnswerStream(iter(["A clear ", "answer."]), [])
+                _chat_tab(Service(), store)
+            """), default_timeout=15).run()
+            self.assertFalse(app.exception)
+            self.assertEqual(len(app.get("popover")), 3)
+            app.multiselect[0].set_value(["/docs/book.pdf"]).run()
+            app.chat_input[0].set_value("Explain the book").run()
+            self.assertFalse(app.exception)
+            self.assertEqual(app.session_state.request_scope, ["/docs/book.pdf"])
+            self.assertEqual(app.session_state.messages[-1]["content"], "A clear answer.")
+            self.assertEqual(len(ConversationStore(Path(store_path)).list()[0]["messages"]), 2)
+
+    def test_empty_chat_guides_user_to_library(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = AppTest.from_string(dedent(f"""
+                from pathlib import Path
+                from types import SimpleNamespace
+                from document_analyst.app import _chat_tab, _initialize_conversation_state
+                from document_analyst.ui.state import initialize_session_state
+                from document_analyst.services.conversation_store import ConversationStore
+                initialize_session_state()
+                store = ConversationStore(Path({str(Path(directory) / "conversations.json")!r}))
+                _initialize_conversation_state(store)
+                _chat_tab(SimpleNamespace(indexed_documents=lambda: []), store)
+            """), default_timeout=15).run()
+            self.assertFalse(app.exception)
+            self.assertTrue(app.chat_input[0].disabled)
+            next(b for b in app.button if b.label == "Go to Library").click().run()
+            self.assertEqual(app.session_state.active_view, "Library")
+
     def _library_app(self):
         return AppTest.from_string(dedent("""
             import streamlit as st
@@ -215,6 +264,20 @@ class UiFoundationTests(unittest.TestCase):
         next(b for b in app.button if b.key == "view-/docs/book10.pdf").click().run()
         self.assertFalse(app.exception)
         self.assertEqual(app.session_state.fetch, ("/docs/book10.pdf", 0, 10))
+        self.assertTrue(any("Extracted passages: book10.pdf" in h.value for h in app.subheader))
+
+    def test_passage_viewer_paginates_without_fetching_all_chunks(self) -> None:
+        app = AppTest.from_string(dedent("""
+            import streamlit as st
+            from document_analyst.app import _document_passages_panel
+            class Service:
+                def document_chunks(self, path, offset=0, limit=10):
+                    st.session_state.fetch = (path, offset, limit)
+                    return [{"sequence": i, "approx_page": i + 1, "text": f"Stored passage {i}"}
+                            for i in range(offset, min(offset + limit, 23))]
+            _document_passages_panel(Service(), {"document_name": "book10.pdf",
+                "source_path": "/docs/book10.pdf", "chunks": 23})
+        """), default_timeout=15).run()
         next(n for n in app.number_input if n.label == "Passage page").set_value(3).run()
         self.assertFalse(app.exception)
         self.assertEqual(app.session_state.fetch, ("/docs/book10.pdf", 20, 10))
@@ -366,9 +429,10 @@ class UiFoundationTests(unittest.TestCase):
         ).run()
         self.assertFalse(app.exception)
         self.assertEqual(app.session_state.renders, 2)
+        self.assertEqual([e.label for e in app.expander], ["Add a document folder", "Performance options"])
         markup = "\n".join(item.value for item in app.markdown)
         self.assertIn("book.pdf", markup)
-        self.assertIn("42 chunks", markup)
+        self.assertTrue(any("42 chunks" in c.value for c in app.caption))
         self.assertEqual(app.metric[0].value, "10.0 s")
         self.assertFalse(any(b.label in ("Dismiss", "Cancel indexing") for b in app.button))
         self.assertFalse(next(b for b in app.button if b.label == "Build Index").disabled)

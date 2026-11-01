@@ -86,12 +86,17 @@ document-analyst
 
 ## Initial configuration
 
-1. Open **Settings**.
-2. Select and download an embedding model and a GGUF language model.
-3. Configure retrieval and OCR settings if required.
-4. Open **Library** and specify a local document directory.
-5. Build the index.
-6. Open **Ask** and query the indexed collection.
+1. In the welcome dialog, choose **Proceed with recommended settings** to download the default models.
+2. In **Library**, open **Add a document folder**, select your local directory, and click **Build Index**.
+3. Open **Ask** to chat with your documents. Use **Search scope** to limit the documents searched.
+4. Use **Conversations** to switch or export chats, and **Search tools** for evidence search and diagnostics.
+
+Library shows compact document rows. **View passages** opens a paginated dialog; **Details**
+shows the file path and document management actions. **Performance options** stays collapsed
+until needed, and indexing progress remains visible outside the setup controls.
+
+In **Settings**, model readiness and the download action appear first. Open **Change models**
+to choose alternatives, or enable advanced settings for retrieval, chunking, and OCR controls.
 
 Model downloads may require several gigabytes of disk space, depending on the selected GGUF file.
 
