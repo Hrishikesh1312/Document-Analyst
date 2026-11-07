@@ -7,7 +7,7 @@ from textwrap import dedent
 
 from streamlit.testing.v1 import AppTest
 
-from document_analyst.app import _citation_links, _highlight_text
+from document_analyst.app import _citation_links, _highlight_text, _starter_prompts
 from document_analyst.services.conversation_store import ConversationStore
 from document_analyst.ui.components import model_display_name
 from document_analyst.ui.theme import THEME_CSS
@@ -205,6 +205,88 @@ class UiFoundationTests(unittest.TestCase):
             self.assertEqual(app.session_state.request_scope, ["/docs/book.pdf"])
             self.assertEqual(app.session_state.messages[-1]["content"], "A clear answer.")
             self.assertEqual(len(ConversationStore(Path(store_path)).list()[0]["messages"]), 2)
+            popover_labels = [item.proto.popover.label for item in app.get("popover")]
+            self.assertIn("Copy", popover_labels)
+            self.assertIn("Ask a follow-up", popover_labels)
+            self.assertTrue(any(item.label == "Regenerate" for item in app.button))
+            self.assertTrue(any(item.label == "Export" for item in app.get("download_button")))
+
+    def test_starter_prompt_submits_a_real_question(self) -> None:
+        with tempfile.TemporaryDirectory() as directory:
+            app = AppTest.from_string(dedent(f"""
+                import streamlit as st
+                from pathlib import Path
+                from document_analyst.app import _chat_tab, _initialize_conversation_state
+                from document_analyst.ui.state import initialize_session_state
+                from document_analyst.services.conversation_store import ConversationStore
+                from document_analyst.services.rag import AnswerStream
+
+                initialize_session_state()
+                store = ConversationStore(Path({str(Path(directory) / "conversations.json")!r}))
+                _initialize_conversation_state(store)
+                class Service:
+                    def indexed_documents(self):
+                        return [{{"source_path": "/docs/book.pdf", "document_name": "book.pdf"}}]
+                    def answer_question_stream(self, prompt, history, **kwargs):
+                        st.session_state.submitted_prompt = prompt
+                        return AnswerStream(iter(["A starter answer."]), [])
+                _chat_tab(Service(), store)
+            """), default_timeout=15).run()
+            next(b for b in app.button if b.label == "Summarise “book.pdf”").click().run()
+            self.assertFalse(app.exception)
+            self.assertEqual(
+                app.session_state.submitted_prompt,
+                "Summarise the main themes from book.pdf.",
+            )
+
+    def test_starter_prompts_follow_the_available_scope(self) -> None:
+        documents = {
+            "/docs/annual.pdf": "annual.pdf",
+            "/docs/forecast.docx": "forecast.docx",
+            "/docs/notes.md": "notes.md",
+        }
+        all_prompts = _starter_prompts(documents, [])
+        scoped_prompts = _starter_prompts(documents, ["/docs/notes.md"])
+
+        self.assertIn("annual.pdf", all_prompts[0][1])
+        self.assertIn("forecast.docx", all_prompts[1][1])
+        self.assertIn("annual.pdf and forecast.docx", all_prompts[2][1])
+        self.assertIn("all 3 documents", all_prompts[3][1])
+        self.assertTrue(all("notes.md" in prompt for _, prompt in scoped_prompts))
+
+    def test_workspace_status_routes_to_the_missing_setup_step(self) -> None:
+        app = AppTest.from_string(dedent("""
+            from document_analyst.app import _workspace_status
+            class Models:
+                def local_embedding_model_exists(self): return False
+                def local_llm_model_path(self): return None
+            class Service:
+                models = Models()
+            _workspace_status(Service(), {"documents": 0, "chunks": 0})
+        """), default_timeout=15).run()
+        self.assertFalse(app.exception)
+        self.assertIn("Setup needs attention", "\n".join(m.value for m in app.markdown))
+        next(b for b in app.button if b.label == "Open settings").click().run()
+        self.assertEqual(app.session_state.active_view, "Settings")
+
+    def test_source_card_prioritizes_passage_and_hides_scores_in_details(self) -> None:
+        app = AppTest.from_string(dedent("""
+            from document_analyst.app import _source_card
+            from document_analyst.models import SourceRecord
+            _source_card(SourceRecord(
+                source_id="S1", document_name="book.pdf", source_path="/docs/book.pdf",
+                text="The supporting passage.", score=0.8, approx_page=12,
+                semantic_score=0.7, lexical_score=1.2,
+            ))
+        """), default_timeout=15).run()
+        self.assertFalse(app.exception)
+        markup = "\n".join(m.value for m in app.markdown)
+        self.assertIn("High relevance", markup)
+        self.assertIn("The supporting passage", markup)
+        self.assertTrue(any(item.label == "Open document" for item in app.get("link_button")))
+        popover_labels = [item.proto.popover.label for item in app.get("popover")]
+        self.assertIn("Copy citation", popover_labels)
+        self.assertIn("Technical details", popover_labels)
 
     def test_empty_chat_guides_user_to_library(self) -> None:
         with tempfile.TemporaryDirectory() as directory:

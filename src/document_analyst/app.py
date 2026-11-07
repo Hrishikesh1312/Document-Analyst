@@ -91,7 +91,8 @@ def run() -> None:
         st.session_state.show_empty_state_dialog = False
 
     active_view = _sidebar(settings, service, conversation_store)
-
+    page_heading(active_view)
+    _workspace_status(service, stats)
 
     if (
         stats["documents"] == 0
@@ -112,6 +113,67 @@ def run() -> None:
 
 def _select_workspace_view() -> None:
     st.session_state.active_view = st.session_state.workspace_navigation
+
+
+def _workspace_status(service: RagService, stats: dict) -> None:
+    embedding_ready = service.models.local_embedding_model_exists()
+    llm_ready = bool(service.models.local_llm_model_path())
+    models_ready = embedding_ready and llm_ready
+    document_count = int(stats.get("documents", 0))
+    chunk_count = int(stats.get("chunks", 0))
+
+    if models_ready and document_count:
+        st.markdown(
+            f"""
+            <div class="da-workspace-status ready compact">
+                <span class="da-status-dot"></span>
+                <strong>Ready</strong>
+                <span>{document_count:,} document{'s' if document_count != 1 else ''} · {chunk_count:,} passages</span>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        return
+    elif not models_ready:
+        missing = []
+        if not embedding_ready:
+            missing.append("search model")
+        if not llm_ready:
+            missing.append("answer model")
+        title = "Setup needs attention"
+        detail = f"Install the {' and '.join(missing)} to use your local workspace."
+        state_class = "attention"
+        action_label = "Open settings"
+        target_view = "Settings"
+    else:
+        title = "Models ready"
+        detail = "Add a document folder to create your searchable library."
+        state_class = "attention"
+        action_label = "Add documents"
+        target_view = "Library"
+
+    status_markup = f"""
+        <div class="da-workspace-status {state_class} compact">
+            <span class="da-status-dot"></span>
+            <strong>{html.escape(title)}</strong>
+            <span>{html.escape(detail)}</span>
+        </div>
+    """
+    if st.session_state.get("active_view") == target_view:
+        st.markdown(status_markup, unsafe_allow_html=True)
+        return
+
+    status_column, action_column = st.columns([6, 1], vertical_alignment="center")
+    with status_column:
+        st.markdown(status_markup, unsafe_allow_html=True)
+    with action_column:
+        if st.button(
+            action_label,
+            key=f"workspace-status-{target_view.lower()}",
+            use_container_width=True,
+        ):
+            st.session_state.active_view = target_view
+            st.rerun()
 
 
 def _sidebar(
@@ -257,15 +319,22 @@ def _empty_state_dialog(settings: AppSettings, service: RagService) -> None:
 
 
 def _chat_tab(service: RagService, conversation_store: ConversationStore) -> None:
-    page_heading("Ask")
     indexed_documents = service.indexed_documents()
     document_labels = {
         str(item["source_path"]): str(item["document_name"]) for item in indexed_documents
     }
-    conversation_column, scope_column, tools_column = st.columns([1.2, 1, 1], gap="small")
-    with conversation_column.popover("Conversations", use_container_width=True):
+    conversation_column, scope_column, tools_column, _ = st.columns(
+        [1.15, 1, .8, 3.2], gap="small"
+    )
+    with conversation_column.popover(
+        "Chats", icon=":material/chat_bubble:", use_container_width=True
+    ):
         _conversation_panel(conversation_store)
-    with scope_column.popover("Search scope", use_container_width=True):
+    selected_scope = st.session_state.get("chat_document_filter", [])
+    scope_button_label = f"{len(selected_scope)} documents" if selected_scope else "All documents"
+    with scope_column.popover(
+        scope_button_label, icon=":material/filter_alt:", use_container_width=True
+    ):
         st.markdown("#### Search in")
         selected = st.session_state.get("chat_document_filter", [])
         if any(path not in document_labels for path in selected):
@@ -276,17 +345,29 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
             placeholder="All indexed documents", key="chat_document_filter",
             help="Leave empty to search the entire library.",
         )
-    with tools_column.popover("Search tools", use_container_width=True):
+    with tools_column.popover(
+        "Tools", icon=":material/tune:", use_container_width=True
+    ):
         st.text_input("Search retrieved evidence", key="evidence_search", placeholder="Find text in source passages")
         st.toggle("Show retrieval diagnostics", key="show_retrieval_diagnostics")
-    scope = st.session_state.get("chat_document_filter", [])
-    scope_label = f"{len(scope)} selected documents" if scope else "All documents"
-    st.caption(f"{st.session_state.conversation_name} · {scope_label}")
 
+    queued_prompt = st.session_state.pop("pending_chat_prompt", None)
+    regenerate_prompt = st.session_state.pop("pending_regenerate_prompt", None)
     if not st.session_state.messages:
         if document_labels:
             empty_state("What would you like to understand?",
                         "Ask a question, compare ideas, or find a passage in your documents.", "⌕")
+            starter_prompts = _starter_prompts(
+                document_labels,
+                st.session_state.get("chat_document_filter", []),
+            )
+            first_row = st.columns(2, gap="small")
+            second_row = st.columns(2, gap="small")
+            for index, (column, (label, prompt_text)) in enumerate(
+                zip(first_row + second_row, starter_prompts)
+            ):
+                if column.button(label, key=f"starter-{index}", use_container_width=True):
+                    queued_prompt = prompt_text
         else:
             empty_state("Add your first documents", "Build a library, then ask questions with sources you can check.", "▤")
             if st.button("Go to Library", type="primary"):
@@ -296,25 +377,33 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
         with st.chat_message(message["role"]):
             if message["role"] == "assistant":
                 st.markdown(_citation_links(message["content"], index))
-                with st.expander("Copy answer with citations", expanded=False):
-                    st.code(message["content"], language=None)
             else:
                 st.markdown(message["content"])
             if message["role"] == "assistant":
                 sources = st.session_state.sources_by_turn.get(index, [])
+                _answer_actions(
+                    message["content"],
+                    index,
+                    sources,
+                    conversation_store,
+                    is_latest=index == len(st.session_state.messages) - 1,
+                )
                 if sources:
-                    with st.expander("Sources", expanded=False):
+                    with st.expander(f"Sources ({len(sources)})", expanded=False):
                         _sources_panel(sources, f"turn-{index}")
                 diagnostics = st.session_state.diagnostics_by_turn.get(index)
                 if diagnostics and st.session_state.show_retrieval_diagnostics:
                     with st.expander("Retrieval diagnostics", expanded=False):
                         _diagnostics_panel(diagnostics)
 
-    prompt = st.chat_input("Ask a question about your documents…", disabled=not bool(document_labels))
+    prompt = queued_prompt or regenerate_prompt or st.chat_input(
+        "Ask a question about your documents…", disabled=not bool(document_labels)
+    )
     if prompt:
-        st.session_state.messages.append({"role": "user", "content": prompt})
-        with st.chat_message("user"):
-            st.markdown(prompt)
+        if not regenerate_prompt:
+            st.session_state.messages.append({"role": "user", "content": prompt})
+            with st.chat_message("user"):
+                st.markdown(prompt)
 
         with st.chat_message("assistant"):
             try:
@@ -329,10 +418,11 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
                     answer = st.write_stream(result.chunks)
             except (OSError, RuntimeError, ValueError) as exc:
                 st.error(f"Could not answer the question: {exc}")
-                st.session_state.messages.pop()
+                if not regenerate_prompt:
+                    st.session_state.messages.pop()
                 return
             turn_index = len(st.session_state.messages)
-            with st.expander("Sources", expanded=True):
+            with st.expander(f"Sources ({len(result.sources)})", expanded=True):
                 _sources_panel(result.sources, f"turn-{turn_index}")
             if result.diagnostics and st.session_state.show_retrieval_diagnostics:
                 with st.expander("Retrieval diagnostics", expanded=True):
@@ -346,8 +436,72 @@ def _chat_tab(service: RagService, conversation_store: ConversationStore) -> Non
             _persist_current_conversation(conversation_store)
         st.rerun()
 
+
+def _starter_prompts(
+    document_labels: dict[str, str], selected_paths: list[str]
+) -> list[tuple[str, str]]:
+    paths = [path for path in selected_paths if path in document_labels]
+    if not paths:
+        paths = list(document_labels)
+    names = [document_labels[path] for path in paths]
+    if not names:
+        return []
+
+    first = names[0]
+    first_label = _short_document_label(first)
+    if len(names) == 1:
+        return [
+            (
+                f"Summarise {first_label}",
+                f"Summarise the main themes from {first}.",
+            ),
+            (
+                f"Key findings in {first_label}",
+                f"What are the key findings and conclusions in {first}?",
+            ),
+            (
+                f"Important passages in {first_label}",
+                f"Find the most important passages in {first} and explain why they matter.",
+            ),
+            (
+                f"Brief me on {first_label}",
+                f"Create a concise briefing on {first} with supporting sources.",
+            ),
+        ]
+
+    second = names[1]
+    second_label = _short_document_label(second)
+    collection_label = (
+        "both documents" if len(names) == 2 else f"all {len(names)} documents"
+    )
+    return [
+        (
+            f"Summarise {first_label}",
+            f"Summarise the main themes from {first}.",
+        ),
+        (
+            f"Summarise {second_label}",
+            f"Summarise the main themes from {second}.",
+        ),
+        (
+            f"Compare {first_label} and {second_label}",
+            f"Compare the key ideas, findings, and points of disagreement in {first} and {second}.",
+        ),
+        (
+            f"Brief me on {collection_label}",
+            f"Create a concise briefing across {collection_label} with the main findings and supporting sources.",
+        ),
+    ]
+
+
+def _short_document_label(name: str, limit: int = 30) -> str:
+    if len(name) <= limit:
+        return f"“{name}”"
+    suffix = Path(name).suffix
+    available = max(8, limit - len(suffix) - 1)
+    return f"“{name[:available]}…{suffix}”"
+
 def _help_tab() -> None:
-    page_heading("Help")
     with st.expander("Getting started", expanded=True):
         st.markdown(
             "1. In the welcome popup, choose **Proceed with recommended settings** to download "
@@ -418,7 +572,6 @@ def _help_tab() -> None:
 
 
 def _docs_tab(settings: AppSettings, service: RagService) -> None:
-    page_heading("Library")
     docs = service.document_statuses()
     active_job = st.session_state.get("index_job")
     indexing = bool(active_job and active_job.thread and active_job.thread.is_alive())
@@ -729,7 +882,6 @@ def _format_elapsed_time(seconds: float) -> str:
 
 
 def _models_tab(settings: AppSettings, service: RagService) -> None:
-    page_heading("Settings")
     download_notice = st.session_state.pop("model_download_notice", None)
     if download_notice:
         st.toast(download_notice, icon=":material/check_circle:")
@@ -945,6 +1097,87 @@ def _tesseract_available(configured_command: str = "") -> bool:
         return shutil.which("tesseract") is not None
     candidate = Path(command).expanduser()
     return (candidate.is_file() and os.access(candidate, os.X_OK)) or shutil.which(command) is not None
+
+
+def _answer_actions(
+    answer: str,
+    turn_index: int,
+    sources: list[SourceRecord],
+    conversation_store: ConversationStore,
+    *,
+    is_latest: bool,
+) -> None:
+    plain_answer = re.sub(r"\s*\[S\d+\]", "", answer).strip()
+    cited_answer = _answer_markdown(answer, sources)
+    copy_column, export_column, follow_up_column, regenerate_column = st.columns(
+        [1, 1, 1.25, 1.25], gap="small"
+    )
+    with copy_column.popover(
+        "Copy", icon=":material/content_copy:", use_container_width=True
+    ):
+        answer_tab, citations_tab = st.tabs(["Answer", "With citations"])
+        with answer_tab:
+            st.caption("Use the copy icon in the code block.")
+            st.code(plain_answer, language=None)
+        with citations_tab:
+            st.caption("Includes a source list for sharing.")
+            st.code(cited_answer, language=None)
+    export_column.download_button(
+        "Export",
+        cited_answer,
+        file_name=f"answer-{turn_index}.md",
+        mime="text/markdown",
+        icon=":material/download:",
+        key=f"export-answer-{turn_index}",
+        use_container_width=True,
+    )
+    if is_latest:
+        with follow_up_column.popover(
+            "Ask a follow-up", icon=":material/add_comment:", use_container_width=True
+        ):
+            st.caption("Continue from this answer")
+            follow_ups = [
+                "Explain that more simply.",
+                "What evidence best supports that answer?",
+                "What are the most important implications?",
+            ]
+            for follow_up in follow_ups:
+                if st.button(
+                    follow_up,
+                    key=f"follow-up-{turn_index}-{follow_up}",
+                    use_container_width=True,
+                ):
+                    st.session_state.pending_chat_prompt = follow_up
+                    st.rerun()
+        if regenerate_column.button(
+            "Regenerate",
+            icon=":material/refresh:",
+            key=f"regenerate-{turn_index}",
+            use_container_width=True,
+        ):
+            previous_index = turn_index - 1
+            if previous_index >= 0 and st.session_state.messages[previous_index]["role"] == "user":
+                prompt = st.session_state.messages[previous_index]["content"]
+                st.session_state.messages.pop()
+                st.session_state.sources_by_turn.pop(turn_index, None)
+                st.session_state.diagnostics_by_turn.pop(turn_index, None)
+                st.session_state.pending_regenerate_prompt = prompt
+                _persist_current_conversation(conversation_store)
+                st.rerun()
+    else:
+        follow_up_column.empty()
+        regenerate_column.empty()
+
+
+def _answer_markdown(answer: str, sources: list[SourceRecord]) -> str:
+    if not sources:
+        return answer.strip()
+    source_lines = [
+        f"- [{source.source_id}] {source.document_name}, page {source.approx_page} — "
+        f"{source.source_path}"
+        for source in sources
+    ]
+    return f"{answer.strip()}\n\nSources\n\n" + "\n".join(source_lines)
 
 
 @st.dialog("Legacy PowerPoint files are not supported", width="large")
@@ -1189,22 +1422,66 @@ def _source_card(
 ) -> None:
     source_id = html.escape(str(source.source_id))
     document_name = html.escape(str(source.document_name))
-    source_path = html.escape(str(source.source_path))
     source_text = _highlight_text(
         str(source.text), search or getattr(source, "matched_passage", "")
     )
     anchor = html.escape(f"{anchor_prefix}-{str(source.source_id).lower()}", quote=True)
-    st.markdown(
-        f"""
-        <div class="source-card" id="{anchor}">
-            <strong>[{source_id}] {document_name}</strong><br/>
-            <span class="muted">{source_path}</span><br/>
-            <span class="accent">Page {source.approx_page} • hybrid {source.score:.3f} • semantic {source.semantic_score:.3f} • BM25 {source.lexical_score:.3f}</span>
-            <p style="margin:0.6rem 0 0 0;">{source_text}</p>
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
+    relevance, relevance_class = _relevance_label(float(source.score))
+    st.markdown(f'<span id="{anchor}"></span>', unsafe_allow_html=True)
+    with st.container(border=True):
+        st.markdown(
+            f"""
+            <div class="da-source-heading">
+                <div><strong>[{source_id}] {document_name}</strong><span>Page {source.approx_page}</span></div>
+                <span class="da-relevance {relevance_class}">{relevance}</span>
+            </div>
+            <div class="da-source-passage">{source_text}</div>
+            """,
+            unsafe_allow_html=True,
+        )
+        open_column, citation_column, details_column = st.columns([1.2, 1.2, 2], gap="small")
+        source_url = _source_url(str(source.source_path), int(source.approx_page))
+        open_column.link_button(
+            "Open document",
+            source_url,
+            icon=":material/open_in_new:",
+            use_container_width=True,
+            help="Open the local source file, at the cited page when supported.",
+        )
+        citation = f"[{source.source_id}] {source.document_name}, page {source.approx_page}"
+        with citation_column.popover(
+            "Copy citation", icon=":material/content_copy:", use_container_width=True
+        ):
+            st.caption("Use the copy icon in the code block.")
+            st.code(citation, language=None)
+        with details_column.popover(
+            "Technical details", icon=":material/tune:", use_container_width=True
+        ):
+            st.caption("Source file")
+            st.text(str(source.source_path))
+            st.caption(
+                f"Hybrid score {source.score:.3f} · Semantic {source.semantic_score:.3f} · "
+                f"BM25 {source.lexical_score:.3f}"
+            )
+
+
+def _source_url(source_path: str, page: int) -> str:
+    path = Path(source_path).expanduser()
+    try:
+        url = path.resolve().as_uri()
+    except ValueError:
+        return "#"
+    if path.suffix.casefold() == ".pdf":
+        return f"{url}#page={max(1, page)}"
+    return url
+
+
+def _relevance_label(score: float) -> tuple[str, str]:
+    if score >= 0.65:
+        return "High relevance", "high"
+    if score >= 0.35:
+        return "Relevant", "medium"
+    return "Supporting", "supporting"
 
 
 def _highlight_text(text: str, search: str) -> str:
